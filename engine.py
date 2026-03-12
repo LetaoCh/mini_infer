@@ -56,6 +56,7 @@ class MiniInferenceEngine:
         self.active[req_id] = future
         try:
             await self.pending.put(request)
+            print(f"req {req_id} queued")
             result = await future
             return result
         finally:
@@ -91,6 +92,10 @@ class MiniInferenceEngine:
 
             req.batch_start_time = time.time()
             self.active_slots.append(ActiveRequest(request=req))
+            print(
+                f"req {req.request_id} started"
+                f" after {req.batch_start_time - req.arrival_time:.2f}s"
+            )
             admitted += 1
 
     async def _run_decode_step(self):
@@ -129,6 +134,11 @@ class MiniInferenceEngine:
                         batching_delay=batch_start_time - req.arrival_time,
                         processing_delay=completion_time - batch_start_time,
                     )
+                )
+                print(
+                    f"req {req.request_id} done"
+                    f" wait={batch_start_time - req.arrival_time:.2f}s"
+                    f" run={completion_time - batch_start_time:.2f}s"
                 )
             else:
                 still_active.append(slot)
