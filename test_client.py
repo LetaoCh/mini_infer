@@ -25,7 +25,7 @@ async def send_one(client: httpx.AsyncClient, i: int, max_new_tokens: int):
 
 
 async def main():
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         tasks = [
             send_one(client, 0, 2),
             send_one(client, 1, 5),
