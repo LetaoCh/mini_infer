@@ -1,13 +1,5 @@
 from dataclasses import dataclass
-from enum import Enum, auto
 from typing import Optional
-
-
-class RequestStatus(Enum):
-    PENDING = auto()
-    ACTIVE = auto()
-    FINISHED = auto()
-    FAILED = auto()
 
 
 @dataclass
@@ -29,3 +21,10 @@ class InferenceResult:
     completion_time: float
     batching_delay: float
     processing_delay: float
+
+
+@dataclass
+class ActiveRequest:
+    request: InferenceRequest
+    generated_tokens: int = 0
+    output_text: str = ""

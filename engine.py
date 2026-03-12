@@ -1,50 +1,54 @@
 import asyncio
-import time
 import itertools
+import time
 
-from typing import List
-
-from .types import InferenceRequest, InferenceResult
+from .types import InferenceRequest, InferenceResult, ActiveRequest
 
 
 class MiniInferenceEngine:
-    def __init__(self, max_requests, batch_size=1):
+    def __init__(self, max_requests: int, batch_size: int = 4):
         self.batch_size = batch_size
-        self.max_wait_time = 0.05
-
-        self.pending = asyncio.Queue(max_requests)
-        self.batches = asyncio.Queue(max_requests)
+        self.pending: asyncio.Queue[InferenceRequest] = asyncio.Queue(max_requests)
         self.active: dict[int, asyncio.Future] = {}
-        self.engine_tasks: List[asyncio.Task] = []
+        self.active_slots: list[ActiveRequest] = []
+
+        self.scheduler_task: asyncio.Task | None = None
         self._request_id_gen = itertools.count(1)
 
-    async def start(self):
-        if self.engine_tasks:
-            return
+        # Stage 3 knobs
+        self.decode_step_time = 0.2
+        self.max_admit_per_tick = batch_size
 
-        engine_loop_task = asyncio.create_task(self._engine_loop())
-        batcher_task = asyncio.create_task(self._batching())
-        self.engine_tasks = [engine_loop_task, batcher_task]
+    async def start(self):
+        if self.scheduler_task is not None and not self.scheduler_task.done():
+            return
+        self.scheduler_task = asyncio.create_task(self._scheduler_loop())
 
     async def stop(self):
-        for task in self.engine_tasks:
-            task.cancel()
+        if self.scheduler_task is not None and not self.scheduler_task.done():
+            self.scheduler_task.cancel()
             try:
-                await task
+                await self.scheduler_task
             except asyncio.CancelledError:
                 pass
-        self.engine_tasks = []
+        self.scheduler_task = None
 
-        for future in self.active.values():
-            if not future.done():
-                future.set_exception(RuntimeError("engine stopped"))
+        for fut in self.active.values():
+            if not fut.done():
+                fut.set_exception(RuntimeError("engine stopped"))
         self.active.clear()
+        self.active_slots.clear()
 
     async def submit_request(self, prompt: str, max_new_tokens: int) -> InferenceResult:
         req_id = next(self._request_id_gen)
         now = time.time()
-        request = InferenceRequest(req_id, prompt, max_new_tokens, now)
-        print(f"[request {req_id}] arrived at {now:.6f}")
+
+        request = InferenceRequest(
+            request_id=req_id,
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            arrival_time=now,
+        )
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
@@ -55,77 +59,78 @@ class MiniInferenceEngine:
             result = await future
             return result
         finally:
-            self.active.pop(request.request_id, None)
+            self.active.pop(req_id, None)
 
-    async def _batching(self):
+    async def _scheduler_loop(self):
         while True:
-            batch = []
-            first_request = await self.pending.get()
-            first_arrival_time = first_request.arrival_time
-            deadline = first_arrival_time + self.max_wait_time
-            batch.append(first_request)
+            if not self.active_slots:
+                first_req = await self.pending.get()
+                first_req.batch_start_time = time.time()
+                self.active_slots.append(ActiveRequest(request=first_req))
 
-            while len(batch) < self.batch_size:
-                try:
-                    req = self.pending.get_nowait()
-                    batch.append(req)
-                except asyncio.QueueEmpty:
-                    break
+            await self._admit_new_requests()
 
-            while len(batch) < self.batch_size:
-                now = time.time()
-                remaining = deadline - now
-                if remaining <= 0:
-                    break
-                try:
-                    req = await asyncio.wait_for(self.pending.get(), timeout=remaining)
-                    batch.append(req)
-                except asyncio.TimeoutError:
-                    break
-            batch_start_time = time.time()
-            for request in batch:
-                request.batch_start_time = batch_start_time
-            request_ids = [request.request_id for request in batch]
-            print(f"[batch] start={batch_start_time:.6f} size={len(batch)} requests={request_ids}")
-            await self.batches.put(batch)
+            await self._run_decode_step()
 
-    async def _process(self, batch):
-        for request in batch:
-            request_id = request.request_id
+            self._finalize_finished_requests()
 
-            future = self.active.get(request_id)
-            if future is None or future.done():
+    async def _admit_new_requests(self):
+        admitted = 0
+        while (
+            len(self.active_slots) < self.batch_size
+            and admitted < self.max_admit_per_tick
+        ):
+            try:
+                req = self.pending.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            future = self.active.get(req.request_id)
+            if future is None or future.done() or future.cancelled():
                 continue
 
-            try:
+            req.batch_start_time = time.time()
+            self.active_slots.append(ActiveRequest(request=req))
+            admitted += 1
+
+    async def _run_decode_step(self):
+        if not self.active_slots:
+            return
+
+        # fake one decode iteration for all active requests
+        await asyncio.sleep(self.decode_step_time)
+
+        for slot in self.active_slots:
+            slot.generated_tokens += 1
+            slot.output_text += f"<tok{slot.generated_tokens}>"
+
+    def _finalize_finished_requests(self):
+        still_active: list[ActiveRequest] = []
+
+        for slot in self.active_slots:
+            req = slot.request
+            future = self.active.get(req.request_id)
+
+            if future is None or future.done() or future.cancelled():
+                continue
+
+            if slot.generated_tokens >= req.max_new_tokens:
                 completion_time = time.time()
-                batch_start_time = request.batch_start_time or completion_time
+                batch_start_time = req.batch_start_time or completion_time
+
                 future.set_result(
                     InferenceResult(
-                        request_id=request.request_id,
-                        text=f"fake completion for: {request.prompt}",
+                        request_id=req.request_id,
+                        text=f"{req.prompt} -> {slot.output_text}",
                         finish_reason="completed",
-                        arrival_time=request.arrival_time,
+                        arrival_time=req.arrival_time,
                         batch_start_time=batch_start_time,
                         completion_time=completion_time,
-                        batching_delay=batch_start_time - request.arrival_time,
+                        batching_delay=batch_start_time - req.arrival_time,
                         processing_delay=completion_time - batch_start_time,
                     )
                 )
-                print(
-                    f"[request {request_id}] completed at {completion_time:.6f} "
-                    f"batching_delay={batch_start_time - request.arrival_time:.6f}s "
-                    f"processing_delay={completion_time - batch_start_time:.6f}s"
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                if not future.done():
-                    future.set_exception(e)
-            finally:
-                self.active.pop(request_id, None)
+            else:
+                still_active.append(slot)
 
-    async def _engine_loop(self):
-        while True:
-            batch = await self.batches.get()
-            await self._process(batch)
+        self.active_slots = still_active
