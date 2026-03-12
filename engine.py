@@ -1,7 +1,6 @@
 import asyncio
 import time
 import itertools
-import random
 
 from typing import List
 
@@ -12,11 +11,12 @@ class MiniInferenceEngine:
     def __init__(self, max_requests, batch_size=1):
         self.batch_size = batch_size
         self.max_wait_time = 0.05
+        self.decode_step_time = 0.05  # fixed decode latency
         self._request_id_gen = itertools.count(1)
 
         self.pending = asyncio.Queue(max_requests)
         self.active: dict[int, asyncio.Future] = {}
-        self.active_slots = []
+        self.active_slots: List[ActiveRequest] = []
 
         self.scheduler_task = None
 
@@ -37,22 +37,28 @@ class MiniInferenceEngine:
         for fut in self.active.values():
             if not fut.done():
                 fut.set_exception(RuntimeError("engine stopped"))
+
         self.active.clear()
         self.active_slots.clear()
 
     async def submit_request(self, prompt: str, max_new_tokens: int) -> InferenceResult:
         req_id = next(self._request_id_gen)
         now = time.time()
+
         request = InferenceRequest(req_id, prompt, max_new_tokens, now)
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
 
         self.active[req_id] = future
+
         try:
             await self.pending.put(request)
+            print(f"[QUEUE] request {req_id} queued")
+
             result = await future
             return result
+
         finally:
             self.active.pop(request.request_id, None)
 
@@ -66,9 +72,14 @@ class MiniInferenceEngine:
     async def _maybe_wait_for_first_request(self):
         if self.active_slots:
             return
+
         request = await self.pending.get()
+        request.batch_start_time = time.time()
+
         active_request = ActiveRequest(request)
         self.active_slots.append(active_request)
+
+        print(f"[ADMIT] request {request.request_id} admitted (first slot)")
 
     async def _admit_new_requests(self):
         while len(self.active_slots) < self.batch_size:
@@ -76,20 +87,29 @@ class MiniInferenceEngine:
                 request = self.pending.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
             request.batch_start_time = time.time()
             active_request = ActiveRequest(request)
+
             self.active_slots.append(active_request)
+
+            print(f"[ADMIT] request {request.request_id} admitted")
 
     async def _run_decode_step(self):
         if not self.active_slots:
             return
-        await asyncio.sleep(random.randint(0, 100) / 100)
+
+        print(f"[DECODE] tick | active={len(self.active_slots)}")
+
+        await asyncio.sleep(self.decode_step_time)
+
         for r in self.active_slots:
             r.generated_tokens += 1
             r.output_text += f"<tok {r.generated_tokens}>"
 
     def _finalize_finished_requests(self):
         still_active = []
+
         for active_r in self.active_slots:
             r = active_r.request
             r_id = r.request_id
@@ -104,6 +124,7 @@ class MiniInferenceEngine:
 
             completion_time = time.time()
             batch_start_time = r.batch_start_time or completion_time
+
             fut.set_result(
                 InferenceResult(
                     request_id=r.request_id,
@@ -116,6 +137,9 @@ class MiniInferenceEngine:
                     processing_delay=completion_time - batch_start_time,
                 )
             )
+
+            print(f"[FINISH] request {r_id} finished")
+
             self.active.pop(r_id, None)
 
         self.active_slots = still_active
