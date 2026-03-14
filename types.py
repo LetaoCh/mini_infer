@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional
+from enum import Enum, auto
 
 
 @dataclass
@@ -8,7 +9,8 @@ class InferenceRequest:
     prompt: str
     max_new_tokens: int
     arrival_time: float
-    batch_start_time: Optional[float] = None
+    admit_time: Optional[float] = None
+    service_start_time: Optional[float] = None
 
 
 @dataclass
@@ -16,11 +18,15 @@ class InferenceResult:
     request_id: int
     text: str
     finish_reason: str
-    arrival_time: float
-    batch_start_time: float
-    completion_time: float
-    batching_delay: float
-    processing_delay: float
+    arrival_time: float = 0
+    service_start_time: float = 0
+    completion_time: float = 0
+    batching_delay: float = 0
+    processing_delay: float = 0
+
+
+class OverloadedError(Exception):
+    pass
 
 
 @dataclass
