@@ -4,21 +4,32 @@ import time
 
 from typing import List
 
-from .types import InferenceRequest, InferenceResult, OverloadedError, ActiveRequest
+from .types import (
+    ActiveRequest,
+    InferenceRequest,
+    InferenceResult,
+    OverloadedError,
+    RequestContext,
+)
 
 
 class MiniInferenceEngine:
     def __init__(self, max_requests, batch_size=1):
         self.batch_size = batch_size
         self.max_wait_time = 0.05
-        self.decode_step_time = 0.05  # fixed decode latency
+        self.decode_step_time = 0.05
         self._request_id_gen = itertools.count(1)
 
         self.pending = asyncio.Queue(max_requests)
-        self.active: dict[int, asyncio.Future] = {}
+        self.active: dict[int, RequestContext] = {}
         self.active_slots: List[ActiveRequest] = []
 
         self.scheduler_task = None
+
+        self.submitted_total = 0
+        self.completed_total = 0
+        self.rejected_total = 0
+        self.decode_ticks_total = 0
 
     async def start(self):
         if self.scheduler_task is not None and not self.scheduler_task.done():
@@ -34,33 +45,58 @@ class MiniInferenceEngine:
                 pass
         self.scheduler_task = None
 
-        for fut in self.active.values():
-            if not fut.done():
-                fut.set_exception(RuntimeError("engine stopped"))
+        for ctx in self.active.values():
+            if not ctx.future.done():
+                ctx.future.set_exception(RuntimeError("engine stopped"))
+            ctx.token_queue.put_nowait(None)
 
         self.active.clear()
         self.active_slots.clear()
 
-    async def submit_request(self, prompt: str, max_new_tokens: int) -> InferenceResult:
+    def _build_request(self, prompt: str, max_new_tokens: int):
         req_id = next(self._request_id_gen)
         now = time.time()
+
         request = InferenceRequest(req_id, prompt, max_new_tokens, now)
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
 
+        ctx = RequestContext(request_id=req_id, future=future)
+
+        return request, ctx
+
+    def _enqueue_request(self, request: InferenceRequest, ctx: RequestContext) -> None:
         try:
             self.pending.put_nowait(request)
         except asyncio.QueueFull:
+            self.rejected_total += 1
             raise OverloadedError("system full, try again later")
 
-        self.active[req_id] = future
+        self.active[request.request_id] = ctx
+        self.submitted_total += 1
+        print(f"[QUEUE] request {request.request_id} queued")
+
+    async def submit_request(self, prompt: str, max_new_tokens: int) -> InferenceResult:
+        request, ctx = self._build_request(prompt, max_new_tokens)
+        self._enqueue_request(request, ctx)
+
         try:
-            print(f"[QUEUE] request {req_id} queued")
-            result = await future
+            result = await ctx.future
             return result
         finally:
             self.active.pop(request.request_id, None)
+
+    async def submit_streaming_request(self, prompt: str, max_new_tokens: int) -> RequestContext:
+        request, ctx = self._build_request(prompt, max_new_tokens)
+        self._enqueue_request(request, ctx)
+        return ctx
+
+    def cancel_request(self, request_id: int):
+        ctx = self.active.get(request_id)
+        if ctx is None:
+            return
+        ctx.cancelled = True
 
     async def _scheduler_loop(self):
         while True:
@@ -70,6 +106,7 @@ class MiniInferenceEngine:
             else:
                 await self._admit_new_requests(initial_fill=False)
 
+            self._remove_cancelled_requests()
             await self._run_decode_step()
             self._finalize_finished_requests()
 
@@ -79,8 +116,7 @@ class MiniInferenceEngine:
 
         request = await self.pending.get()
         request.admit_time = time.time()
-        self.active_slots.append(ActiveRequest(request))
-
+        self.active_slots.append(ActiveRequest(request=request))
         print(f"[ADMIT] request {request.request_id} admitted (first slot)")
 
     async def _admit_new_requests(self, initial_fill: bool):
@@ -107,7 +143,7 @@ class MiniInferenceEngine:
                     break
 
             request.admit_time = time.time()
-            self.active_slots.append(ActiveRequest(request))
+            self.active_slots.append(ActiveRequest(request=request))
             print(f"[ADMIT] request {request.request_id} admitted")
 
     async def _run_decode_step(self):
@@ -115,6 +151,8 @@ class MiniInferenceEngine:
             return
 
         tick_start = time.time()
+        self.decode_ticks_total += 1
+
         for active_r in self.active_slots:
             if active_r.request.service_start_time is None:
                 active_r.request.service_start_time = tick_start
@@ -124,7 +162,12 @@ class MiniInferenceEngine:
 
         for active_r in self.active_slots:
             active_r.generated_tokens += 1
-            active_r.output_text += f"<tok {active_r.generated_tokens}>"
+            generated_token = f"<tok {active_r.generated_tokens}>"
+            active_r.output_text += generated_token
+
+            ctx = self.active.get(active_r.request.request_id)
+            if ctx is not None:
+                ctx.token_queue.put_nowait(generated_token)
 
     def _finalize_finished_requests(self):
         still_active = []
@@ -137,14 +180,16 @@ class MiniInferenceEngine:
                 still_active.append(active_r)
                 continue
 
-            fut = self.active.get(r_id)
-            if fut is None or fut.done():
+            ctx = self.active.get(r_id)
+            if ctx is None or ctx.future.done():
                 continue
 
             completion_time = time.time()
             service_start_time = r.service_start_time or completion_time
+            self.completed_total += 1
 
-            fut.set_result(
+            ctx.token_queue.put_nowait(None)
+            ctx.future.set_result(
                 InferenceResult(
                     request_id=r.request_id,
                     text=f"{r.prompt} -> {active_r.output_text}",
@@ -158,6 +203,35 @@ class MiniInferenceEngine:
             )
 
             print(f"[FINISH] request {r_id} finished")
-            self.active.pop(r_id, None)
+
+        self.active_slots = still_active
+
+    def get_stats(self):
+        return {
+            "submitted_total": self.submitted_total,
+            "completed_total": self.completed_total,
+            "rejected_total": self.rejected_total,
+            "decode_ticks_total": self.decode_ticks_total,
+            "pending_queue": self.pending.qsize(),
+            "active_requests": len(self.active_slots),
+        }
+
+    def _remove_cancelled_requests(self):
+        still_active = []
+
+        for active_r in self.active_slots:
+            r_id = active_r.request.request_id
+            ctx = self.active.get(r_id)
+
+            if ctx is not None and ctx.cancelled:
+                if not ctx.future.done():
+                    ctx.future.set_exception(asyncio.CancelledError())
+
+                ctx.token_queue.put_nowait(None)
+                print(f"[CANCEL] request {r_id} cancelled")
+                self.active.pop(r_id, None)
+                continue
+
+            still_active.append(active_r)
 
         self.active_slots = still_active

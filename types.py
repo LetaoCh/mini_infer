@@ -1,6 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
-from enum import Enum, auto
+import asyncio
 
 
 @dataclass
@@ -27,6 +27,14 @@ class InferenceResult:
 
 class OverloadedError(Exception):
     pass
+
+
+@dataclass
+class RequestContext:
+    request_id: int
+    future: asyncio.Future
+    token_queue: asyncio.Queue[Optional[str]] = field(default_factory=asyncio.Queue)
+    cancelled: bool = False
 
 
 @dataclass
