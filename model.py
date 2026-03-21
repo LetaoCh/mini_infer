@@ -26,11 +26,11 @@ def main():
     print("output shape:", outputs.logits.shape)
 
     # Get the logits for the LAST position only.
-    next_token_logits = outputs.logits[:, -1, :] # (B, 1, C) -> (B, C)
+    next_token_logits = outputs.logits[:, -1, :]  # (B, 1, C) -> (B, C)
     print("next_token_logits shape:", next_token_logits.shape)
 
     # Greedy decode: pick argmax token
-    next_token_id = torch.argmax(next_token_logits, dim=-1) # (1)
+    next_token_id = torch.argmax(next_token_logits, dim=-1)  # (1)
     print("next_token_id shape:", next_token_id.shape)
 
     generated_ids = [next_token_id.item()]
@@ -39,7 +39,7 @@ def main():
     # Decode 3 more tokens
     for step in range(3):
         # Build input_ids for decode step using ONLY the newest token.
-        decode_input_ids = next_token_id.unsqueeze(0) # (1, 1)
+        decode_input_ids = next_token_id.unsqueeze(0)  # (1, 1)
         print(f"Step {step} decode_input_ids shape:", decode_input_ids.shape)
 
         with torch.no_grad():
@@ -53,9 +53,8 @@ def main():
         next_token_logits = outputs.logits[:, -1, :]
         print(f"Step {step} next_token_logits shape:", next_token_logits.shape)
 
-
         # Greedy pick the next token.
-        next_token_id = torch.argmax(next_token_logits, dim=-1) # (1)
+        next_token_id = torch.argmax(next_token_logits, dim=-1)  # (1)
         print(f"Step {step} next_token_id shape:", next_token_id.shape)
 
         generated_ids.append(next_token_id.item())

@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 import asyncio
+import torch
 
 
 @dataclass
@@ -42,3 +43,6 @@ class ActiveRequest:
     request: InferenceRequest
     generated_tokens: int = 0
     output_text: str = ""
+    past_key_values: Any = None
+    last_token_id: Optional[torch.Tensor] = None
+    prefill_done: bool = False

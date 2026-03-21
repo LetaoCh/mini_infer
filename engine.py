@@ -1,8 +1,10 @@
 import asyncio
 import itertools
 import time
+import torch
 
 from typing import List
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from .types import (
     ActiveRequest,
@@ -30,6 +32,30 @@ class MiniInferenceEngine:
         self.completed_total = 0
         self.rejected_total = 0
         self.decode_ticks_total = 0
+
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+        model_name = "Qwen/Qwen2.5-3B-Instruct"
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+        )
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if self.device.type == "mps" else torch.float32,
+            trust_remote_code=True,
+        ).to(self.device)
+
+        self.model.eval()
+
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
     async def start(self):
         if self.scheduler_task is not None and not self.scheduler_task.done():
@@ -107,7 +133,7 @@ class MiniInferenceEngine:
                 await self._admit_new_requests(initial_fill=False)
 
             self._remove_cancelled_requests()
-            await self._run_decode_step()
+            await self._run_prefill_or_decode_step()
             self._finalize_finished_requests()
 
     async def _maybe_wait_for_first_request(self):
@@ -146,7 +172,68 @@ class MiniInferenceEngine:
             self.active_slots.append(ActiveRequest(request=request))
             print(f"[ADMIT] request {request.request_id} admitted")
 
-    async def _run_decode_step(self):
+    async def _run_prefill_for_request(self, active_r, ctx):
+        # prompt = active_r.request.prompt
+        # inputs = self.tokenizer(prompt, return_tensors="pt")
+        # input_ids = inputs["input_ids"].to(self.device)
+        # attention_mask = inputs["attention_mask"].to(self.device)
+
+        prompt = active_r.request.prompt
+
+        messages = [{"role": "user", "content": prompt}]
+
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        inputs = self.tokenizer(text, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+            )
+
+        next_token_logits = outputs.logits[:, -1, :]  # (B, T, C) -> (B, C)
+        probs = torch.softmax(next_token_logits / 0.8, dim=-1)
+        next_token_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        active_r.past_key_values = outputs.past_key_values
+        active_r.last_token_id = next_token_id
+        active_r.prefill_done = True
+
+        generated_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=True)
+        active_r.output_text += generated_token
+        active_r.generated_tokens += 1
+        ctx.token_queue.put_nowait(generated_token)
+
+    async def _run_decode_for_request(self, active_r, ctx):
+        decode_input_ids = active_r.last_token_id.unsqueeze(0)  # [1] -> [1,1]
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=decode_input_ids,
+                past_key_values=active_r.past_key_values,
+                use_cache=True,
+            )
+
+        next_token_logits = outputs.logits[:, -1, :]
+        next_token_id = torch.argmax(next_token_logits, dim=-1)
+
+        active_r.past_key_values = outputs.past_key_values
+        active_r.last_token_id = next_token_id
+
+        generated_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=True)
+        active_r.output_text += generated_token
+        active_r.generated_tokens += 1
+        ctx.token_queue.put_nowait(generated_token)
+
+    async def _run_prefill_or_decode_step(self):
         if not self.active_slots:
             return
 
@@ -157,17 +244,17 @@ class MiniInferenceEngine:
             if active_r.request.service_start_time is None:
                 active_r.request.service_start_time = tick_start
 
-        print(f"[DECODE] tick | active={len(self.active_slots)}")
-        await asyncio.sleep(self.decode_step_time)
+        print(f"[PREFILL/DECODE] tick | active={len(self.active_slots)}")
 
         for active_r in self.active_slots:
-            active_r.generated_tokens += 1
-            generated_token = f"<tok {active_r.generated_tokens}>"
-            active_r.output_text += generated_token
-
             ctx = self.active.get(active_r.request.request_id)
-            if ctx is not None:
-                ctx.token_queue.put_nowait(generated_token)
+            if ctx is None:
+                continue
+
+            if not active_r.prefill_done:
+                await self._run_prefill_for_request(active_r, ctx)
+            else:
+                await self._run_decode_for_request(active_r, ctx)
 
     def _finalize_finished_requests(self):
         still_active = []
@@ -176,7 +263,15 @@ class MiniInferenceEngine:
             r = active_r.request
             r_id = r.request_id
 
-            if active_r.generated_tokens < r.max_new_tokens:
+            last_token_id = None
+            if active_r.last_token_id is not None:
+                last_token_id = active_r.last_token_id.item()
+
+            hit_eos = self.tokenizer.eos_token_id is not None and last_token_id == self.tokenizer.eos_token_id
+            hit_max_tokens = active_r.generated_tokens >= r.max_new_tokens
+            print("last_token_id:", last_token_id, "eos_token_id:", self.tokenizer.eos_token_id)
+
+            if not hit_eos and not hit_max_tokens:
                 still_active.append(active_r)
                 continue
 
@@ -192,8 +287,8 @@ class MiniInferenceEngine:
             ctx.future.set_result(
                 InferenceResult(
                     request_id=r.request_id,
-                    text=f"{r.prompt} -> {active_r.output_text}",
-                    finish_reason="completed",
+                    text=active_r.output_text,
+                    finish_reason="eos" if hit_eos else "length",
                     arrival_time=r.arrival_time,
                     service_start_time=service_start_time,
                     completion_time=completion_time,
