@@ -14,6 +14,7 @@ settings = load_app_settings()
 engine = MiniInferenceEngine(
     settings.max_requests,
     batch_size=settings.batch_size,
+    model_backend=settings.model_backend,
     model_name=settings.model_name,
     server_profile=settings.server_profile,
     prefill_mode=settings.prefill_mode,

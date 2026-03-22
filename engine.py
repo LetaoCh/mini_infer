@@ -25,6 +25,7 @@ class MiniInferenceEngine:
         self,
         max_requests,
         batch_size=1,
+        model_backend: str = "hf",
         model_name=None,
         server_profile: str = "custom",
         prefill_mode: PrefillMode = "batched",
@@ -36,6 +37,7 @@ class MiniInferenceEngine:
         self.max_wait_time = 0.05
         self._request_id_gen = itertools.count(1)
         self.server_profile = server_profile
+        self.model_backend = model_backend
         self.prefill_mode = self._validate_prefill_mode(prefill_mode)
         self.decode_mode = self._validate_decode_mode(decode_mode)
         self.tick_log_every = max(1, tick_log_every)
@@ -52,7 +54,7 @@ class MiniInferenceEngine:
         self.rejected_total = 0
         self.decode_ticks_total = 0
 
-        bundle = load_model_bundle(model_name) if model_name else load_model_bundle()
+        bundle = load_model_bundle(model_name=model_name, model_backend=model_backend)
         self.tokenizer = bundle.tokenizer
         self.model = bundle.model
         self.device = bundle.device
@@ -78,6 +80,7 @@ class MiniInferenceEngine:
             "ENGINE",
             status="started",
             model=self.model_name,
+            backend=self.model_backend,
             device=self.device.type,
             profile=self.server_profile,
             batch_size=self.batch_size,
@@ -274,6 +277,8 @@ class MiniInferenceEngine:
 
     def _build_model_cache(self, past_key_values):
         if past_key_values is None or hasattr(past_key_values, "get_seq_length"):
+            return past_key_values
+        if self.model_backend != "hf":
             return past_key_values
         return DynamicCache(past_key_values, config=self.model.config)
 
@@ -604,6 +609,7 @@ class MiniInferenceEngine:
 
         return {
             "server_profile": self.server_profile,
+            "model_backend": self.model_backend,
             "model_name": self.model_name,
             "device": self.device.type,
             "batch_size": self.batch_size,

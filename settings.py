@@ -7,6 +7,7 @@ class AppSettings:
     server_profile: str = "custom"
     max_requests: int = 64
     batch_size: int = 4
+    model_backend: str = "hf"
     model_name: str | None = None
     prefill_mode: str = "batched"
     decode_mode: str = "batched"
@@ -51,6 +52,7 @@ def load_app_settings() -> AppSettings:
         server_profile=base.server_profile,
         max_requests=int(os.getenv("MAX_REQUESTS", str(base.max_requests))),
         batch_size=int(os.getenv("BATCH_SIZE", str(base.batch_size))),
+        model_backend=os.getenv("MODEL_BACKEND", base.model_backend),
         model_name=os.getenv("MODEL_NAME") or base.model_name,
         prefill_mode=os.getenv("PREFILL_MODE", base.prefill_mode),
         decode_mode=os.getenv("DECODE_MODE", base.decode_mode),
