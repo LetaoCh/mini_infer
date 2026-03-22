@@ -1,4 +1,5 @@
 import asyncio
+import argparse
 import json
 import os
 import statistics
@@ -47,6 +48,30 @@ class StreamMetrics:
     retries: int = 0
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Benchmark /generate and /generate_stream.")
+    parser.add_argument("--base-url", default=BASE_URL, help="Server base URL.")
+    parser.add_argument("--prompt", default=PROMPT, help="Prompt used for every request.")
+    parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS, help="Token budget per request.")
+    parser.add_argument("--num-requests", type=int, default=NUM_REQUESTS, help="Total requests per benchmark.")
+    parser.add_argument("--concurrency", type=int, default=CONCURRENCY, help="Concurrent client requests.")
+    parser.add_argument("--timeout", type=float, default=TIMEOUT, help="HTTP timeout in seconds.")
+    parser.add_argument("--max-retries", type=int, default=MAX_RETRIES, help="Retry count on 503.")
+    parser.add_argument(
+        "--retry-backoff-sec",
+        type=float,
+        default=RETRY_BACKOFF_SEC,
+        help="Base retry backoff in seconds.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["all", "generate", "stream"],
+        default="all",
+        help="Which benchmark to run.",
+    )
+    return parser.parse_args()
+
+
 def percentile(values: list[float], p: float) -> float:
     if not values:
         return 0.0
@@ -63,17 +88,24 @@ def percentile(values: list[float], p: float) -> float:
     return d0 + d1
 
 
-def retry_delay(attempt: int) -> float:
-    return RETRY_BACKOFF_SEC * (2**attempt)
+def retry_delay(attempt: int, retry_backoff_sec: float) -> float:
+    return retry_backoff_sec * (2**attempt)
 
 
-async def bench_generate_one(client: httpx.AsyncClient, prompt: str, max_new_tokens: int) -> GenerateMetrics:
+async def bench_generate_one(
+    client: httpx.AsyncClient,
+    base_url: str,
+    prompt: str,
+    max_new_tokens: int,
+    max_retries: int,
+    retry_backoff_sec: float,
+) -> GenerateMetrics:
     start = time.perf_counter()
     retries = 0
     while True:
         try:
             resp = await client.post(
-                f"{BASE_URL}/generate",
+                f"{base_url}/generate",
                 json={"prompt": prompt, "max_new_tokens": max_new_tokens},
             )
             latency = time.perf_counter() - start
@@ -93,8 +125,8 @@ async def bench_generate_one(client: httpx.AsyncClient, prompt: str, max_new_tok
                 retries=retries,
             )
         except httpx.HTTPStatusError as error:
-            if error.response.status_code == 503 and retries < MAX_RETRIES:
-                await asyncio.sleep(retry_delay(retries))
+            if error.response.status_code == 503 and retries < max_retries:
+                await asyncio.sleep(retry_delay(retries, retry_backoff_sec))
                 retries += 1
                 continue
 
@@ -119,7 +151,14 @@ async def bench_generate_one(client: httpx.AsyncClient, prompt: str, max_new_tok
             )
 
 
-async def bench_stream_one(client: httpx.AsyncClient, prompt: str, max_new_tokens: int) -> StreamMetrics:
+async def bench_stream_one(
+    client: httpx.AsyncClient,
+    base_url: str,
+    prompt: str,
+    max_new_tokens: int,
+    max_retries: int,
+    retry_backoff_sec: float,
+) -> StreamMetrics:
     start = time.perf_counter()
     retries = 0
     while True:
@@ -132,7 +171,7 @@ async def bench_stream_one(client: httpx.AsyncClient, prompt: str, max_new_token
         try:
             async with client.stream(
                 "POST",
-                f"{BASE_URL}/generate_stream",
+                f"{base_url}/generate_stream",
                 json={"prompt": prompt, "max_new_tokens": max_new_tokens},
             ) as resp:
                 resp.raise_for_status()
@@ -175,8 +214,8 @@ async def bench_stream_one(client: httpx.AsyncClient, prompt: str, max_new_token
                 retries=retries,
             )
         except httpx.HTTPStatusError as error:
-            if error.response.status_code == 503 and retries < MAX_RETRIES:
-                await asyncio.sleep(retry_delay(retries))
+            if error.response.status_code == 503 and retries < max_retries:
+                await asyncio.sleep(retry_delay(retries, retry_backoff_sec))
                 retries += 1
                 continue
 
@@ -291,41 +330,59 @@ def print_stream_summary(results: list[StreamMetrics], total_wall_time: float):
             print(f"  - {r.error}")
 
 
-async def run_generate_benchmark():
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+async def run_generate_benchmark(args):
+    async with httpx.AsyncClient(timeout=args.timeout) as client:
 
         async def one(_i: int):
-            return await bench_generate_one(client, PROMPT, MAX_NEW_TOKENS)
+            return await bench_generate_one(
+                client,
+                args.base_url,
+                args.prompt,
+                args.max_new_tokens,
+                args.max_retries,
+                args.retry_backoff_sec,
+            )
 
         wall_start = time.perf_counter()
-        results = await run_with_limit(one, NUM_REQUESTS, CONCURRENCY)
+        results = await run_with_limit(one, args.num_requests, args.concurrency)
         total_wall_time = time.perf_counter() - wall_start
 
     print_generate_summary(results, total_wall_time)
 
 
-async def run_stream_benchmark():
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+async def run_stream_benchmark(args):
+    async with httpx.AsyncClient(timeout=args.timeout) as client:
 
         async def one(_i: int):
-            return await bench_stream_one(client, PROMPT, MAX_NEW_TOKENS)
+            return await bench_stream_one(
+                client,
+                args.base_url,
+                args.prompt,
+                args.max_new_tokens,
+                args.max_retries,
+                args.retry_backoff_sec,
+            )
 
         wall_start = time.perf_counter()
-        results = await run_with_limit(one, NUM_REQUESTS, CONCURRENCY)
+        results = await run_with_limit(one, args.num_requests, args.concurrency)
         total_wall_time = time.perf_counter() - wall_start
 
     print_stream_summary(results, total_wall_time)
 
 
 async def main():
-    print(f"BASE_URL={BASE_URL}")
+    args = parse_args()
+
+    print(f"BASE_URL={args.base_url}")
     print(
-        f"NUM_REQUESTS={NUM_REQUESTS}, CONCURRENCY={CONCURRENCY}, "
-        f"MAX_NEW_TOKENS={MAX_NEW_TOKENS}, MAX_RETRIES={MAX_RETRIES}"
+        f"NUM_REQUESTS={args.num_requests}, CONCURRENCY={args.concurrency}, "
+        f"MAX_NEW_TOKENS={args.max_new_tokens}, MAX_RETRIES={args.max_retries}"
     )
 
-    await run_generate_benchmark()
-    await run_stream_benchmark()
+    if args.mode in {"all", "generate"}:
+        await run_generate_benchmark(args)
+    if args.mode in {"all", "stream"}:
+        await run_stream_benchmark(args)
 
 
 if __name__ == "__main__":

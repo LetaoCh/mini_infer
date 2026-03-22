@@ -245,12 +245,17 @@ class MiniInferenceEngine:
         return next_token_id
 
     def _build_prompt_text(self, prompt: str) -> str:
-        messages = [{"role": "user", "content": prompt}]
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                messages = [{"role": "user", "content": prompt}]
+                return self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except ValueError:
+                pass
+        return prompt
 
     def _prompt_preview(self, prompt: str, max_len: int = 48) -> str:
         compact = " ".join(prompt.split())

@@ -4,7 +4,7 @@ import random
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Prepare plain-text corpora for train_toy.py.")
+    parser = argparse.ArgumentParser(description="Prepare plain-text corpora for training.train_toy.")
     parser.add_argument(
         "--dataset",
         choices=["tinystories", "tinystories_local", "local_text"],
