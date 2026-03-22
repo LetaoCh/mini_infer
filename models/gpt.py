@@ -97,9 +97,7 @@ class GPT(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_embed)
         self.pos_embedding = nn.Embedding(config.max_seq_length, config.d_embed)
 
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(config) for _ in range(config.n_layers)]
-        )
+        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
         self.final_ln = nn.LayerNorm(config.d_embed)
         self.lm_head = nn.Linear(config.d_embed, config.vocab_size)
 
@@ -115,16 +113,16 @@ class GPT(nn.Module):
         assert T <= self.config.max_seq_length, "sequence too long"
 
         positions = torch.arange(T, device=idx.device)  # (T,)
-        tok_emb = self.token_embedding(idx)             # (B, T, C)
-        pos_emb = self.pos_embedding(positions)         # (T, C)
+        tok_emb = self.token_embedding(idx)  # (B, T, C)
+        pos_emb = self.pos_embedding(positions)  # (T, C)
 
-        x = tok_emb + pos_emb                           # (B, T, C)
+        x = tok_emb + pos_emb  # (B, T, C)
 
         for block in self.blocks:
             x = block(x)
 
         x = self.final_ln(x)
-        logits = self.lm_head(x)                        # (B, T, V)
+        logits = self.lm_head(x)  # (B, T, V)
 
         loss = None
         if targets is not None:
@@ -142,9 +140,9 @@ class GPT(nn.Module):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.config.max_seq_length :]
             logits, _ = self(idx_cond)
-            next_token_logits = logits[:, -1, :]              # (B, V)
+            next_token_logits = logits[:, -1, :]  # (B, V)
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)  # (B, 1)
-            idx = torch.cat([idx, next_token], dim=1)         # (B, T+1)
+            idx = torch.cat([idx, next_token], dim=1)  # (B, T+1)
 
         return idx
 

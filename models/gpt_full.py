@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 DEFAULT_MAX_SEQ_LENGTH = 256
 
 

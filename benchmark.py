@@ -64,7 +64,7 @@ def percentile(values: list[float], p: float) -> float:
 
 
 def retry_delay(attempt: int) -> float:
-    return RETRY_BACKOFF_SEC * (2 ** attempt)
+    return RETRY_BACKOFF_SEC * (2**attempt)
 
 
 async def bench_generate_one(client: httpx.AsyncClient, prompt: str, max_new_tokens: int) -> GenerateMetrics:
