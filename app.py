@@ -1,4 +1,5 @@
 import json
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, status, Request
@@ -27,7 +28,12 @@ class GenerateResponse(BaseModel):
 
 
 max_request = 10
-engine = MiniInferenceEngine(max_request, batch_size=4)
+engine = MiniInferenceEngine(
+    max_request,
+    batch_size=4,
+    prefill_mode=os.getenv("PREFILL_MODE", "batched"),
+    decode_mode=os.getenv("DECODE_MODE", "batched"),
+)
 
 
 @asynccontextmanager

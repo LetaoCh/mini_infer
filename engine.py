@@ -4,7 +4,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from typing import List
+from typing import List, Literal
 from transformers.cache_utils import DynamicCache
 
 from .model import load_model_bundle
@@ -17,11 +17,24 @@ from .types import (
 )
 
 
+PrefillMode = Literal["single", "batched"]
+DecodeMode = Literal["single", "batched"]
+
+
 class MiniInferenceEngine:
-    def __init__(self, max_requests, batch_size=1, model_name=None):
+    def __init__(
+        self,
+        max_requests,
+        batch_size=1,
+        model_name=None,
+        prefill_mode: PrefillMode = "batched",
+        decode_mode: DecodeMode = "batched",
+    ):
         self.batch_size = batch_size
         self.max_wait_time = 0.05
         self._request_id_gen = itertools.count(1)
+        self.prefill_mode = self._validate_prefill_mode(prefill_mode)
+        self.decode_mode = self._validate_decode_mode(decode_mode)
 
         self.pending = asyncio.Queue(max_requests)
         self.active: dict[int, RequestContext] = {}
@@ -39,6 +52,16 @@ class MiniInferenceEngine:
         self.model = bundle.model
         self.device = bundle.device
         self.model_name = bundle.model_name
+
+    def _validate_prefill_mode(self, mode: str) -> PrefillMode:
+        if mode not in {"single", "batched"}:
+            raise ValueError(f"invalid prefill_mode: {mode}")
+        return mode
+
+    def _validate_decode_mode(self, mode: str) -> DecodeMode:
+        if mode not in {"single", "batched"}:
+            raise ValueError(f"invalid decode_mode: {mode}")
+        return mode
 
     async def start(self):
         if self.scheduler_task is not None and not self.scheduler_task.done():
@@ -175,6 +198,20 @@ class MiniInferenceEngine:
         next_token_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
         return next_token_id
 
+    def _build_prompt_text(self, prompt: str) -> str:
+        messages = [{"role": "user", "content": prompt}]
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    def _emit_generated_token(self, active_r: ActiveRequest, ctx: RequestContext, token_id: torch.Tensor):
+        generated_token = self.tokenizer.decode(token_id[0], skip_special_tokens=True)
+        active_r.output_text += generated_token
+        active_r.generated_tokens += 1
+        ctx.token_queue.put_nowait(generated_token)
+
     def _normalize_past_key_values(self, past_key_values):
         if past_key_values is None:
             return None
@@ -250,39 +287,60 @@ class MiniInferenceEngine:
 
         return [tuple(x) for x in per_request]
 
-    async def _run_prefill_batched(self, prefill_pairs):
-        if not prefill_pairs:
-            return
-
-        active_reqs = [active_r for active_r, _ctx in prefill_pairs]
-
+    def _tokenize_prompts(self, active_requests: list[ActiveRequest], padding: bool):
         texts = []
-        for active_r in active_reqs:
-            prompt = active_r.request.prompt
-            messages = [{"role": "user", "content": prompt}]
-            text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            texts.append(text)
+        for active_r in active_requests:
+            texts.append(self._build_prompt_text(active_r.request.prompt))
 
         inputs = self.tokenizer(
             texts,
             return_tensors="pt",
-            padding=True,
+            padding=padding,
             truncation=True,
         )
-        input_ids = inputs["input_ids"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
+        return (
+            inputs["input_ids"].to(self.device),
+            inputs["attention_mask"].to(self.device),
+        )
 
+    def _run_prefill_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
         with torch.no_grad():
-            outputs = self.model(
+            return self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 use_cache=True,
             )
 
+    def _apply_prefill_result(
+        self,
+        active_r: ActiveRequest,
+        ctx: RequestContext,
+        next_token_id: torch.Tensor,
+        past_key_values,
+    ):
+        active_r.past_key_values = past_key_values
+        active_r.last_token_id = next_token_id
+        active_r.prefill_done = True
+        self._emit_generated_token(active_r, ctx, next_token_id)
+
+    async def _run_prefill_single(self, prefill_pairs):
+        for active_r, ctx in prefill_pairs:
+            input_ids, attention_mask = self._tokenize_prompts([active_r], padding=False)
+            outputs = self._run_prefill_forward(input_ids, attention_mask)
+
+            next_token_logits = outputs.logits[:, -1, :]
+            next_token_id = self._pick_next_token_id(next_token_logits)
+            past_key_values = self._normalize_past_key_values(outputs.past_key_values)
+
+            self._apply_prefill_result(active_r, ctx, next_token_id, past_key_values)
+
+    async def _run_prefill_batched(self, prefill_pairs):
+        if not prefill_pairs:
+            return
+
+        active_requests = [active_r for active_r, _ctx in prefill_pairs]
+        input_ids, attention_mask = self._tokenize_prompts(active_requests, padding=True)
+        outputs = self._run_prefill_forward(input_ids, attention_mask)
         past_key_values = self._normalize_past_key_values(outputs.past_key_values)
         last_positions = attention_mask.sum(dim=1) - 1  # [B]
         batch_indices = torch.arange(input_ids.size(0), device=self.device)
@@ -296,54 +354,7 @@ class MiniInferenceEngine:
 
         for i, (active_r, ctx) in enumerate(prefill_pairs):
             token_id = next_token_ids[i : i + 1]  # keep shape [1]
-
-            active_r.past_key_values = per_request_pkv[i]
-            active_r.last_token_id = token_id
-            active_r.prefill_done = True
-
-            generated_token = self.tokenizer.decode(token_id[0], skip_special_tokens=True)
-            active_r.output_text += generated_token
-            active_r.generated_tokens += 1
-            ctx.token_queue.put_nowait(generated_token)
-
-    async def _run_prefill_for_request(self, active_r, ctx):
-        # prompt = active_r.request.prompt
-        # inputs = self.tokenizer(prompt, return_tensors="pt")
-        # input_ids = inputs["input_ids"].to(self.device)
-        # attention_mask = inputs["attention_mask"].to(self.device)
-
-        prompt = active_r.request.prompt
-
-        messages = [{"role": "user", "content": prompt}]
-
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        inputs = self.tokenizer(text, return_tensors="pt")
-        input_ids = inputs["input_ids"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=True,
-            )
-
-        next_token_logits = outputs.logits[:, -1, :]  # (B, T, C) -> (B, C)
-        next_token_id = self._pick_next_token_id(next_token_logits)
-
-        active_r.past_key_values = self._normalize_past_key_values(outputs.past_key_values)
-        active_r.last_token_id = next_token_id
-        active_r.prefill_done = True
-
-        generated_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=True)
-        active_r.output_text += generated_token
-        active_r.generated_tokens += 1
-        ctx.token_queue.put_nowait(generated_token)
+            self._apply_prefill_result(active_r, ctx, token_id, per_request_pkv[i])
 
     async def _run_decode_batched(self, decode_pairs):
         if not decode_pairs:
@@ -394,46 +405,27 @@ class MiniInferenceEngine:
             token_id = next_token_ids[i : i + 1]
             active_r.last_token_id = token_id
             active_r.past_key_values = split_past_key_values[i]
+            self._emit_generated_token(active_r, ctx, token_id)
 
-            generated_token = self.tokenizer.decode(token_id[0], skip_special_tokens=True)
-            active_r.output_text += generated_token
-            active_r.generated_tokens += 1
-            ctx.token_queue.put_nowait(generated_token)
+    async def _run_decode_single(self, decode_pairs):
+        for active_r, ctx in decode_pairs:
+            decode_input_ids = active_r.last_token_id.unsqueeze(0)  # [1] -> [1,1]
 
-    async def _run_decode_for_request(self, active_r, ctx):
-        decode_input_ids = active_r.last_token_id.unsqueeze(0)  # [1] -> [1,1]
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=decode_input_ids,
+                    past_key_values=self._build_model_cache(active_r.past_key_values),
+                    use_cache=True,
+                )
 
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=decode_input_ids,
-                past_key_values=self._build_model_cache(active_r.past_key_values),
-                use_cache=True,
-            )
+            next_token_logits = outputs.logits[:, -1, :]
+            next_token_id = self._pick_next_token_id(next_token_logits)
 
-        next_token_logits = outputs.logits[:, -1, :]
-        next_token_id = self._pick_next_token_id(next_token_logits)
+            active_r.past_key_values = self._normalize_past_key_values(outputs.past_key_values)
+            active_r.last_token_id = next_token_id
+            self._emit_generated_token(active_r, ctx, next_token_id)
 
-        active_r.past_key_values = self._normalize_past_key_values(outputs.past_key_values)
-        active_r.last_token_id = next_token_id
-
-        generated_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=True)
-        active_r.output_text += generated_token
-        active_r.generated_tokens += 1
-        ctx.token_queue.put_nowait(generated_token)
-
-    async def _run_generation_step(self):
-        if not self.active_slots:
-            return
-
-        tick_start = time.time()
-        self.decode_ticks_total += 1
-
-        for active_r in self.active_slots:
-            if active_r.request.service_start_time is None:
-                active_r.request.service_start_time = tick_start
-
-        print(f"[PREFILL/DECODE] tick | active={len(self.active_slots)}")
-
+    def _collect_generation_pairs(self):
         prefill_pairs = []
         decode_pairs = []
 
@@ -447,9 +439,35 @@ class MiniInferenceEngine:
             else:
                 decode_pairs.append((active_r, ctx))
 
+        return prefill_pairs, decode_pairs
+
+    async def _run_prefill_step(self, prefill_pairs):
+        if self.prefill_mode == "single":
+            await self._run_prefill_single(prefill_pairs)
+            return
         await self._run_prefill_batched(prefill_pairs)
 
+    async def _run_decode_step(self, decode_pairs):
+        if self.decode_mode == "single":
+            await self._run_decode_single(decode_pairs)
+            return
         await self._run_decode_batched(decode_pairs)
+
+    async def _run_generation_step(self):
+        if not self.active_slots:
+            return
+
+        tick_start = time.time()
+        self.decode_ticks_total += 1
+
+        for active_r in self.active_slots:
+            if active_r.request.service_start_time is None:
+                active_r.request.service_start_time = tick_start
+
+        print(f"[PREFILL/DECODE] tick | active={len(self.active_slots)}")
+        prefill_pairs, decode_pairs = self._collect_generation_pairs()
+        await self._run_prefill_step(prefill_pairs)
+        await self._run_decode_step(decode_pairs)
 
         await asyncio.sleep(0)
 
@@ -507,6 +525,8 @@ class MiniInferenceEngine:
             "decode_ticks_total": self.decode_ticks_total,
             "pending_queue": self.pending.qsize(),
             "active_requests": len(self.active_slots),
+            "prefill_mode": self.prefill_mode,
+            "decode_mode": self.decode_mode,
         }
 
     def _remove_cancelled_requests(self):
