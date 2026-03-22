@@ -34,7 +34,7 @@ PROFILE_PRESETS: dict[str, AppSettings] = {
 
 
 def _load_profile_defaults() -> AppSettings:
-    profile_name = os.getenv("SERVER_PROFILE", "").strip().lower()
+    profile_name = os.getenv("SERVER_PROFILE", "balanced").strip().lower()
     if not profile_name:
         return AppSettings()
 
