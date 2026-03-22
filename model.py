@@ -31,7 +31,7 @@ def load_model_bundle(model_name: str = DEFAULT_MODEL_NAME) -> ModelBundle:
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16 if device.type in {"cuda", "mps"} else torch.float32,
+        dtype=torch.float16 if device.type in {"cuda", "mps"} else torch.float32,
         trust_remote_code=True,
     ).to(device)
 

@@ -14,7 +14,7 @@ class AppSettings:
 def load_app_settings() -> AppSettings:
     return AppSettings(
         max_requests=int(os.getenv("MAX_REQUESTS", "10")),
-        batch_size=int(os.getenv("BATCH_SIZE", "16")),
+        batch_size=int(os.getenv("BATCH_SIZE", "8")),
         model_name=os.getenv("MODEL_NAME") or None,
         prefill_mode=os.getenv("PREFILL_MODE", "batched"),
         decode_mode=os.getenv("DECODE_MODE", "batched"),
