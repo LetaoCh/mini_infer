@@ -8,14 +8,13 @@ from typing import List, Literal
 from transformers.cache_utils import DynamicCache
 
 from .model import load_model_bundle
-from .types import (
+from .state import (
     ActiveRequest,
     InferenceRequest,
     InferenceResult,
     OverloadedError,
     RequestContext,
 )
-
 
 PrefillMode = Literal["single", "batched"]
 DecodeMode = Literal["single", "batched"]
@@ -30,11 +29,13 @@ class MiniInferenceEngine:
         prefill_mode: PrefillMode = "batched",
         decode_mode: DecodeMode = "batched",
     ):
+        self.max_requests = max_requests
         self.batch_size = batch_size
         self.max_wait_time = 0.05
         self._request_id_gen = itertools.count(1)
         self.prefill_mode = self._validate_prefill_mode(prefill_mode)
         self.decode_mode = self._validate_decode_mode(decode_mode)
+        self.start_time = None
 
         self.pending = asyncio.Queue(max_requests)
         self.active: dict[int, RequestContext] = {}
@@ -66,8 +67,18 @@ class MiniInferenceEngine:
     async def start(self):
         if self.scheduler_task is not None and not self.scheduler_task.done():
             return
+        self.start_time = time.time()
         self.scheduler_task = asyncio.create_task(self._scheduler_loop())
         self.scheduler_task.add_done_callback(self._handle_scheduler_done)
+        self._log(
+            "ENGINE",
+            status="started",
+            model=self.model_name,
+            device=self.device.type,
+            batch_size=self.batch_size,
+            prefill=self.prefill_mode,
+            decode=self.decode_mode,
+        )
 
     async def stop(self):
         if self.scheduler_task is not None:
@@ -80,6 +91,7 @@ class MiniInferenceEngine:
             except Exception:
                 pass
         self.scheduler_task = None
+        self._log("ENGINE", status="stopped")
 
         for ctx in self.active.values():
             if not ctx.future.done():
@@ -107,11 +119,18 @@ class MiniInferenceEngine:
             self.pending.put_nowait(request)
         except asyncio.QueueFull:
             self.rejected_total += 1
+            self._log("QUEUE", status="rejected", request=request.request_id, pending=self.pending.qsize())
             raise OverloadedError("system full, try again later")
 
         self.active[request.request_id] = ctx
         self.submitted_total += 1
-        print(f"[QUEUE] request {request.request_id} queued")
+        self._log(
+            "QUEUE",
+            status="queued",
+            request=request.request_id,
+            pending=self.pending.qsize(),
+            prompt=self._prompt_preview(request.prompt),
+        )
 
     async def submit_request(self, prompt: str, max_new_tokens: int) -> InferenceResult:
         request, ctx = self._build_request(prompt, max_new_tokens)
@@ -140,7 +159,14 @@ class MiniInferenceEngine:
 
         exc = task.exception()
         if exc is not None:
-            print(f"[SCHEDULER] crashed: {exc!r}")
+            self._log("SCHEDULER", status="crashed", error=repr(exc))
+
+    def _log(self, event: str, **fields):
+        timestamp = time.strftime("%H:%M:%S")
+        suffix = ""
+        if fields:
+            suffix = " | " + " ".join(f"{key}={value}" for key, value in fields.items())
+        print(f"[{timestamp}] {event}{suffix}")
 
     async def _scheduler_loop(self):
         while True:
@@ -161,7 +187,13 @@ class MiniInferenceEngine:
         request = await self.pending.get()
         request.admit_time = time.time()
         self.active_slots.append(ActiveRequest(request=request))
-        print(f"[ADMIT] request {request.request_id} admitted (first slot)")
+        self._log(
+            "ADMIT",
+            request=request.request_id,
+            slot="first",
+            active=len(self.active_slots),
+            pending=self.pending.qsize(),
+        )
 
     async def _admit_new_requests(self, initial_fill: bool):
         deadline = None
@@ -188,7 +220,12 @@ class MiniInferenceEngine:
 
             request.admit_time = time.time()
             self.active_slots.append(ActiveRequest(request=request))
-            print(f"[ADMIT] request {request.request_id} admitted")
+            self._log(
+                "ADMIT",
+                request=request.request_id,
+                active=len(self.active_slots),
+                pending=self.pending.qsize(),
+            )
 
     def _pick_next_token_id(self, next_token_logits):
         return torch.argmax(next_token_logits, dim=-1)
@@ -205,6 +242,12 @@ class MiniInferenceEngine:
             tokenize=False,
             add_generation_prompt=True,
         )
+
+    def _prompt_preview(self, prompt: str, max_len: int = 48) -> str:
+        compact = " ".join(prompt.split())
+        if len(compact) <= max_len:
+            return compact
+        return compact[: max_len - 3] + "..."
 
     def _emit_generated_token(self, active_r: ActiveRequest, ctx: RequestContext, token_id: torch.Tensor):
         generated_token = self.tokenizer.decode(token_id[0], skip_special_tokens=True)
@@ -329,7 +372,7 @@ class MiniInferenceEngine:
             outputs = self._run_prefill_forward(input_ids, attention_mask)
 
             next_token_logits = outputs.logits[:, -1, :]
-            next_token_id = self._pick_next_token_id(next_token_logits)
+            next_token_id = self._pick_next_token_id_sampling(next_token_logits)
             past_key_values = self._normalize_past_key_values(outputs.past_key_values)
 
             self._apply_prefill_result(active_r, ctx, next_token_id, past_key_values)
@@ -345,7 +388,7 @@ class MiniInferenceEngine:
         last_positions = attention_mask.sum(dim=1) - 1  # [B]
         batch_indices = torch.arange(input_ids.size(0), device=self.device)
         next_token_logits = outputs.logits[batch_indices, last_positions, :]
-        next_token_ids = self._pick_next_token_id(next_token_logits)
+        next_token_ids = self._pick_next_token_id_sampling(next_token_logits)
         sequence_lengths = attention_mask.sum(dim=1).tolist()
         per_request_pkv = self._split_past_key_values(
             past_key_values,
@@ -395,7 +438,7 @@ class MiniInferenceEngine:
 
         past_key_values = self._normalize_past_key_values(outputs.past_key_values)
         next_token_logits = outputs.logits[:, -1, :]
-        next_token_ids = self._pick_next_token_id(next_token_logits)
+        next_token_ids = self._pick_next_token_id_sampling(next_token_logits)
         split_past_key_values = self._split_decode_past_key_values(
             past_key_values,
             cache_lengths,
@@ -419,7 +462,7 @@ class MiniInferenceEngine:
                 )
 
             next_token_logits = outputs.logits[:, -1, :]
-            next_token_id = self._pick_next_token_id(next_token_logits)
+            next_token_id = self._pick_next_token_id_sampling(next_token_logits)
 
             active_r.past_key_values = self._normalize_past_key_values(outputs.past_key_values)
             active_r.last_token_id = next_token_id
@@ -464,8 +507,16 @@ class MiniInferenceEngine:
             if active_r.request.service_start_time is None:
                 active_r.request.service_start_time = tick_start
 
-        print(f"[PREFILL/DECODE] tick | active={len(self.active_slots)}")
         prefill_pairs, decode_pairs = self._collect_generation_pairs()
+        self._log(
+            "TICK",
+            active=len(self.active_slots),
+            pending=self.pending.qsize(),
+            prefill=len(prefill_pairs),
+            decode=len(decode_pairs),
+            prefill_mode=self.prefill_mode,
+            decode_mode=self.decode_mode,
+        )
         await self._run_prefill_step(prefill_pairs)
         await self._run_decode_step(decode_pairs)
 
@@ -484,7 +535,6 @@ class MiniInferenceEngine:
 
             hit_eos = self.tokenizer.eos_token_id is not None and last_token_id == self.tokenizer.eos_token_id
             hit_max_tokens = active_r.generated_tokens >= r.max_new_tokens
-            print("last_token_id:", last_token_id, "eos_token_id:", self.tokenizer.eos_token_id)
 
             if not hit_eos and not hit_max_tokens:
                 still_active.append(active_r)
@@ -497,13 +547,14 @@ class MiniInferenceEngine:
             completion_time = time.time()
             service_start_time = r.service_start_time or completion_time
             self.completed_total += 1
+            finish_reason = "eos" if hit_eos else "length"
 
             ctx.token_queue.put_nowait(None)
             ctx.future.set_result(
                 InferenceResult(
                     request_id=r.request_id,
                     text=active_r.output_text,
-                    finish_reason="eos" if hit_eos else "length",
+                    finish_reason=finish_reason,
                     arrival_time=r.arrival_time,
                     service_start_time=service_start_time,
                     completion_time=completion_time,
@@ -513,12 +564,40 @@ class MiniInferenceEngine:
                 )
             )
 
-            print(f"[FINISH] request {r_id} finished")
+            self._log(
+                "FINISH",
+                request=r_id,
+                reason=finish_reason,
+                tokens=active_r.generated_tokens,
+                batching_ms=int((service_start_time - r.arrival_time) * 1000),
+                processing_ms=int((completion_time - service_start_time) * 1000),
+            )
 
         self.active_slots = still_active
 
     def get_stats(self):
+        active_details = []
+        for active_r in self.active_slots:
+            req = active_r.request
+            active_details.append(
+                {
+                    "request_id": req.request_id,
+                    "state": "decode" if active_r.prefill_done else "prefill",
+                    "generated_tokens": active_r.generated_tokens,
+                    "max_new_tokens": req.max_new_tokens,
+                    "prompt_preview": self._prompt_preview(req.prompt, max_len=64),
+                }
+            )
+
+        uptime_sec = 0.0
+        if self.start_time is not None:
+            uptime_sec = max(0.0, time.time() - self.start_time)
+
         return {
+            "model_name": self.model_name,
+            "device": self.device.type,
+            "batch_size": self.batch_size,
+            "queue_capacity": self.max_requests,
             "submitted_total": self.submitted_total,
             "completed_total": self.completed_total,
             "rejected_total": self.rejected_total,
@@ -527,6 +606,9 @@ class MiniInferenceEngine:
             "active_requests": len(self.active_slots),
             "prefill_mode": self.prefill_mode,
             "decode_mode": self.decode_mode,
+            "uptime_sec": round(uptime_sec, 2),
+            "active_request_ids": [item["request_id"] for item in active_details],
+            "active_details": active_details,
         }
 
     def _remove_cancelled_requests(self):
@@ -541,7 +623,7 @@ class MiniInferenceEngine:
                     ctx.future.set_exception(asyncio.CancelledError())
 
                 ctx.token_queue.put_nowait(None)
-                print(f"[CANCEL] request {r_id} cancelled")
+                self._log("CANCEL", request=r_id)
                 self.active.pop(r_id, None)
                 continue
 

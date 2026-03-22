@@ -1,43 +1,27 @@
 import json
-import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, status, Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, StreamingResponse
 
+from .dashboard import STATS_DASHBOARD_HTML
 from .engine import MiniInferenceEngine
-from .types import OverloadedError
+from .schemas import GenerateRequest, GenerateResponse
+from .settings import load_app_settings
+from .state import OverloadedError
 
-
-class GenerateRequest(BaseModel):
-    prompt: str
-    max_new_tokens: int
-
-
-class GenerateResponse(BaseModel):
-    request_id: int
-    text: str
-    finish_reason: str
-    arrival_time: float
-    service_start_time: float
-    completion_time: float
-    batching_delay: float
-    processing_delay: float
-    generated_tokens: int
-
-
-max_request = 10
+settings = load_app_settings()
 engine = MiniInferenceEngine(
-    max_request,
-    batch_size=4,
-    prefill_mode=os.getenv("PREFILL_MODE", "batched"),
-    decode_mode=os.getenv("DECODE_MODE", "batched"),
+    settings.max_requests,
+    batch_size=settings.batch_size,
+    model_name=settings.model_name,
+    prefill_mode=settings.prefill_mode,
+    decode_mode=settings.decode_mode,
 )
 
 
 @asynccontextmanager
-async def lifespan(app):
+async def lifespan(app: FastAPI):
     await engine.start()
     yield
     await engine.stop()
@@ -46,15 +30,19 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 
 
+def raise_service_unavailable(error: OverloadedError):
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=str(error),
+    )
+
+
 @app.post("/generate")
 async def generate(req: GenerateRequest):
     try:
         res = await engine.submit_request(req.prompt, req.max_new_tokens)
-    except OverloadedError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(e),
-        )
+    except OverloadedError as error:
+        raise_service_unavailable(error)
 
     return GenerateResponse(
         request_id=res.request_id,
@@ -73,11 +61,8 @@ async def generate(req: GenerateRequest):
 async def generate_stream(req: GenerateRequest, request: Request):
     try:
         ctx = await engine.submit_streaming_request(req.prompt, req.max_new_tokens)
-    except OverloadedError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(e),
-        )
+    except OverloadedError as error:
+        raise_service_unavailable(error)
 
     async def event_generator():
         disconnected = False
@@ -112,4 +97,9 @@ async def generate_stream(req: GenerateRequest, request: Request):
 
 @app.get("/stats")
 async def stats():
+    return HTMLResponse(STATS_DASHBOARD_HTML)
+
+
+@app.get("/stats.json")
+async def stats_json():
     return engine.get_stats()
