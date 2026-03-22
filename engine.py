@@ -2,8 +2,10 @@ import asyncio
 import itertools
 import time
 import torch
+import torch.nn.functional as F
 
 from typing import List
+from transformers.cache_utils import DynamicCache
 
 from .model import load_model_bundle
 from .types import (
@@ -42,13 +44,17 @@ class MiniInferenceEngine:
         if self.scheduler_task is not None and not self.scheduler_task.done():
             return
         self.scheduler_task = asyncio.create_task(self._scheduler_loop())
+        self.scheduler_task.add_done_callback(self._handle_scheduler_done)
 
     async def stop(self):
-        if self.scheduler_task is not None and not self.scheduler_task.done():
-            self.scheduler_task.cancel()
+        if self.scheduler_task is not None:
+            if not self.scheduler_task.done():
+                self.scheduler_task.cancel()
             try:
                 await self.scheduler_task
             except asyncio.CancelledError:
+                pass
+            except Exception:
                 pass
         self.scheduler_task = None
 
@@ -104,6 +110,14 @@ class MiniInferenceEngine:
         if ctx is None:
             return
         ctx.cancelled = True
+
+    def _handle_scheduler_done(self, task: asyncio.Task):
+        if task.cancelled():
+            return
+
+        exc = task.exception()
+        if exc is not None:
+            print(f"[SCHEDULER] crashed: {exc!r}")
 
     async def _scheduler_loop(self):
         while True:
@@ -161,6 +175,137 @@ class MiniInferenceEngine:
         next_token_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
         return next_token_id
 
+    def _normalize_past_key_values(self, past_key_values):
+        if past_key_values is None:
+            return None
+
+        normalized = []
+        for layer in past_key_values:
+            if len(layer) < 2:
+                raise ValueError(f"unexpected cache layer format: {type(layer)}")
+            normalized.append((layer[0], layer[1]))
+        return tuple(normalized)
+
+    def _build_model_cache(self, past_key_values):
+        if past_key_values is None or hasattr(past_key_values, "get_seq_length"):
+            return past_key_values
+        return DynamicCache(past_key_values, config=self.model.config)
+
+    def _split_past_key_values(self, batched_past_key_values, sequence_lengths):
+        per_request = [[] for _ in range(len(sequence_lengths))]
+
+        for layer_k, layer_v in batched_past_key_values:
+            for i, seq_len in enumerate(sequence_lengths):
+                per_request[i].append(
+                    (
+                        layer_k[i : i + 1, :, :seq_len, :],
+                        layer_v[i : i + 1, :, :seq_len, :],
+                    )
+                )
+
+        return [tuple(x) for x in per_request]
+
+    def _merge_past_key_values(self, active_requests):
+        if not active_requests:
+            return (), []
+
+        cache_lengths = [active_r.past_key_values[0][0].shape[2] for active_r in active_requests]
+        max_cache_len = max(cache_lengths)
+        num_layers = len(active_requests[0].past_key_values)
+
+        merged = []
+        for layer_idx in range(num_layers):
+            keys = []
+            values = []
+
+            for active_r, cache_len in zip(active_requests, cache_lengths):
+                layer_k, layer_v = active_r.past_key_values[layer_idx]
+                pad_len = max_cache_len - cache_len
+
+                if pad_len > 0:
+                    layer_k = F.pad(layer_k, (0, 0, pad_len, 0))
+                    layer_v = F.pad(layer_v, (0, 0, pad_len, 0))
+
+                keys.append(layer_k)
+                values.append(layer_v)
+
+            merged_k = torch.cat(keys, dim=0)
+            merged_v = torch.cat(values, dim=0)
+            merged.append((merged_k, merged_v))
+
+        return tuple(merged), cache_lengths
+
+    def _split_decode_past_key_values(self, batched_past_key_values, prior_cache_lengths):
+        per_request = [[] for _ in range(len(prior_cache_lengths))]
+
+        for layer_k, layer_v in batched_past_key_values:
+            for i, cache_len in enumerate(prior_cache_lengths):
+                keep_len = cache_len + 1
+                per_request[i].append(
+                    (
+                        layer_k[i : i + 1, :, -keep_len:, :],
+                        layer_v[i : i + 1, :, -keep_len:, :],
+                    )
+                )
+
+        return [tuple(x) for x in per_request]
+
+    async def _run_prefill_batched(self, prefill_pairs):
+        if not prefill_pairs:
+            return
+
+        active_reqs = [active_r for active_r, _ctx in prefill_pairs]
+
+        texts = []
+        for active_r in active_reqs:
+            prompt = active_r.request.prompt
+            messages = [{"role": "user", "content": prompt}]
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            texts.append(text)
+
+        inputs = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+        input_ids = inputs["input_ids"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+            )
+
+        past_key_values = self._normalize_past_key_values(outputs.past_key_values)
+        last_positions = attention_mask.sum(dim=1) - 1  # [B]
+        batch_indices = torch.arange(input_ids.size(0), device=self.device)
+        next_token_logits = outputs.logits[batch_indices, last_positions, :]
+        next_token_ids = self._pick_next_token_id(next_token_logits)
+        sequence_lengths = attention_mask.sum(dim=1).tolist()
+        per_request_pkv = self._split_past_key_values(
+            past_key_values,
+            sequence_lengths,
+        )
+
+        for i, (active_r, ctx) in enumerate(prefill_pairs):
+            token_id = next_token_ids[i : i + 1]  # keep shape [1]
+
+            active_r.past_key_values = per_request_pkv[i]
+            active_r.last_token_id = token_id
+            active_r.prefill_done = True
+
+            generated_token = self.tokenizer.decode(token_id[0], skip_special_tokens=True)
+            active_r.output_text += generated_token
+            active_r.generated_tokens += 1
+            ctx.token_queue.put_nowait(generated_token)
+
     async def _run_prefill_for_request(self, active_r, ctx):
         # prompt = active_r.request.prompt
         # inputs = self.tokenizer(prompt, return_tensors="pt")
@@ -191,7 +336,7 @@ class MiniInferenceEngine:
         next_token_logits = outputs.logits[:, -1, :]  # (B, T, C) -> (B, C)
         next_token_id = self._pick_next_token_id(next_token_logits)
 
-        active_r.past_key_values = outputs.past_key_values
+        active_r.past_key_values = self._normalize_past_key_values(outputs.past_key_values)
         active_r.last_token_id = next_token_id
         active_r.prefill_done = True
 
@@ -200,20 +345,75 @@ class MiniInferenceEngine:
         active_r.generated_tokens += 1
         ctx.token_queue.put_nowait(generated_token)
 
+    async def _run_decode_batched(self, decode_pairs):
+        if not decode_pairs:
+            return
+
+        active_requests = [active_r for active_r, _ctx in decode_pairs]
+        batch_input_ids = torch.stack(
+            [active_r.last_token_id for active_r in active_requests],
+            dim=0,
+        )
+
+        batch_past_key_values, cache_lengths = self._merge_past_key_values(active_requests)
+        max_cache_len = max(cache_lengths)
+
+        attention_mask = torch.zeros(
+            len(active_requests),
+            max_cache_len + 1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        for i, cache_len in enumerate(cache_lengths):
+            attention_mask[i, max_cache_len - cache_len :] = 1
+
+        position_ids = torch.tensor(
+            cache_lengths,
+            dtype=torch.long,
+            device=self.device,
+        ).unsqueeze(1)
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=batch_input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=self._build_model_cache(batch_past_key_values),
+                use_cache=True,
+            )
+
+        past_key_values = self._normalize_past_key_values(outputs.past_key_values)
+        next_token_logits = outputs.logits[:, -1, :]
+        next_token_ids = self._pick_next_token_id(next_token_logits)
+        split_past_key_values = self._split_decode_past_key_values(
+            past_key_values,
+            cache_lengths,
+        )
+
+        for i, (active_r, ctx) in enumerate(decode_pairs):
+            token_id = next_token_ids[i : i + 1]
+            active_r.last_token_id = token_id
+            active_r.past_key_values = split_past_key_values[i]
+
+            generated_token = self.tokenizer.decode(token_id[0], skip_special_tokens=True)
+            active_r.output_text += generated_token
+            active_r.generated_tokens += 1
+            ctx.token_queue.put_nowait(generated_token)
+
     async def _run_decode_for_request(self, active_r, ctx):
         decode_input_ids = active_r.last_token_id.unsqueeze(0)  # [1] -> [1,1]
 
         with torch.no_grad():
             outputs = self.model(
                 input_ids=decode_input_ids,
-                past_key_values=active_r.past_key_values,
+                past_key_values=self._build_model_cache(active_r.past_key_values),
                 use_cache=True,
             )
 
         next_token_logits = outputs.logits[:, -1, :]
         next_token_id = self._pick_next_token_id(next_token_logits)
 
-        active_r.past_key_values = outputs.past_key_values
+        active_r.past_key_values = self._normalize_past_key_values(outputs.past_key_values)
         active_r.last_token_id = next_token_id
 
         generated_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=True)
@@ -234,15 +434,24 @@ class MiniInferenceEngine:
 
         print(f"[PREFILL/DECODE] tick | active={len(self.active_slots)}")
 
+        prefill_pairs = []
+        decode_pairs = []
+
         for active_r in self.active_slots:
             ctx = self.active.get(active_r.request.request_id)
             if ctx is None:
                 continue
 
             if not active_r.prefill_done:
-                await self._run_prefill_for_request(active_r, ctx)
+                prefill_pairs.append((active_r, ctx))
             else:
-                await self._run_decode_for_request(active_r, ctx)
+                decode_pairs.append((active_r, ctx))
+
+        await self._run_prefill_batched(prefill_pairs)
+
+        await self._run_decode_batched(decode_pairs)
+
+        await asyncio.sleep(0)
 
     def _finalize_finished_requests(self):
         still_active = []
