@@ -200,12 +200,13 @@ STATS_DASHBOARD_HTML = """
 
     function render(data) {
       document.getElementById("headline").textContent =
-        `${data.model_name} on ${data.device} | prefill=${data.prefill_mode} decode=${data.decode_mode} | uptime=${data.uptime_sec}s`;
+        `${data.model_name} on ${data.device} | profile=${data.server_profile} | prefill=${data.prefill_mode} decode=${data.decode_mode} | uptime=${data.uptime_sec}s`;
 
       document.getElementById("cards").innerHTML = [
         card("Submitted", data.submitted_total, "total requests seen"),
         card("Completed", data.completed_total, "finished requests"),
         card("Rejected", data.rejected_total, "queue full"),
+        card("Profile", data.server_profile, `tick log every ${data.tick_log_every}`),
         card("Active", data.active_requests, `batch size ${data.batch_size}`),
         card("Pending", data.pending_queue, `capacity ${data.queue_capacity}`),
         card("Ticks", data.decode_ticks_total, "scheduler steps"),

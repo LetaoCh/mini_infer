@@ -15,8 +15,10 @@ engine = MiniInferenceEngine(
     settings.max_requests,
     batch_size=settings.batch_size,
     model_name=settings.model_name,
+    server_profile=settings.server_profile,
     prefill_mode=settings.prefill_mode,
     decode_mode=settings.decode_mode,
+    tick_log_every=settings.tick_log_every,
 )
 
 

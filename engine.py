@@ -26,15 +26,19 @@ class MiniInferenceEngine:
         max_requests,
         batch_size=1,
         model_name=None,
+        server_profile: str = "custom",
         prefill_mode: PrefillMode = "batched",
         decode_mode: DecodeMode = "batched",
+        tick_log_every: int = 1,
     ):
         self.max_requests = max_requests
         self.batch_size = batch_size
         self.max_wait_time = 0.05
         self._request_id_gen = itertools.count(1)
+        self.server_profile = server_profile
         self.prefill_mode = self._validate_prefill_mode(prefill_mode)
         self.decode_mode = self._validate_decode_mode(decode_mode)
+        self.tick_log_every = max(1, tick_log_every)
         self.start_time = None
 
         self.pending = asyncio.Queue(max_requests)
@@ -75,9 +79,11 @@ class MiniInferenceEngine:
             status="started",
             model=self.model_name,
             device=self.device.type,
+            profile=self.server_profile,
             batch_size=self.batch_size,
             prefill=self.prefill_mode,
             decode=self.decode_mode,
+            tick_log_every=self.tick_log_every,
         )
 
     async def stop(self):
@@ -508,15 +514,18 @@ class MiniInferenceEngine:
                 active_r.request.service_start_time = tick_start
 
         prefill_pairs, decode_pairs = self._collect_generation_pairs()
-        self._log(
-            "TICK",
-            active=len(self.active_slots),
-            pending=self.pending.qsize(),
-            prefill=len(prefill_pairs),
-            decode=len(decode_pairs),
-            prefill_mode=self.prefill_mode,
-            decode_mode=self.decode_mode,
-        )
+        should_log_tick = bool(prefill_pairs) or self.decode_ticks_total % self.tick_log_every == 0
+        if should_log_tick:
+            self._log(
+                "TICK",
+                tick=self.decode_ticks_total,
+                active=len(self.active_slots),
+                pending=self.pending.qsize(),
+                prefill=len(prefill_pairs),
+                decode=len(decode_pairs),
+                prefill_mode=self.prefill_mode,
+                decode_mode=self.decode_mode,
+            )
         await self._run_prefill_step(prefill_pairs)
         await self._run_decode_step(decode_pairs)
 
@@ -594,6 +603,7 @@ class MiniInferenceEngine:
             uptime_sec = max(0.0, time.time() - self.start_time)
 
         return {
+            "server_profile": self.server_profile,
             "model_name": self.model_name,
             "device": self.device.type,
             "batch_size": self.batch_size,
@@ -606,6 +616,7 @@ class MiniInferenceEngine:
             "active_requests": len(self.active_slots),
             "prefill_mode": self.prefill_mode,
             "decode_mode": self.decode_mode,
+            "tick_log_every": self.tick_log_every,
             "uptime_sec": round(uptime_sec, 2),
             "active_request_ids": [item["request_id"] for item in active_details],
             "active_details": active_details,
