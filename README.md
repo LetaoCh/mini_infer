@@ -83,6 +83,25 @@ Resume a longer run:
   --out checkpoints/toy-gpt.pt
 ```
 
+A full run:
+
+```bash
+.venv/bin/python train_toy.py \
+  --text-file data/generated/tinystories_train.txt \
+  --device mps \
+  --steps 30000 \
+  --batch-size 16 \
+  --seq-len 256 \
+  --d-embed 512 \
+  --n-layers 6 \
+  --n-head 8 \
+  --eval-every 500 \
+  --eval-batches 10 \
+  --sample-every 2000 \
+  --sample-tokens 120 \
+  --out checkpoints/toy-gpt-512d.pt
+```
+
 ## Prepare A Better Training Corpus
 
 Install the dataset helper first:
