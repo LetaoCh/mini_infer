@@ -12,7 +12,7 @@ PROMPT = "Explain what continuous batching is in one short paragraph."
 MAX_NEW_TOKENS = 64
 
 NUM_REQUESTS = 20
-CONCURRENCY = 4
+CONCURRENCY = 16
 TIMEOUT = 120.0
 
 
