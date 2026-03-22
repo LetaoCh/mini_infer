@@ -24,6 +24,7 @@ class InferenceResult:
     completion_time: float = 0
     batching_delay: float = 0
     processing_delay: float = 0
+    generated_tokens: int = 0
 
 
 class OverloadedError(Exception):
@@ -32,6 +33,8 @@ class OverloadedError(Exception):
 
 @dataclass
 class RequestContext:
+    """Per-request lifecycle state exposed to API/streaming path."""
+
     request_id: int
     future: asyncio.Future
     token_queue: asyncio.Queue[Optional[str]] = field(default_factory=asyncio.Queue)
@@ -40,6 +43,8 @@ class RequestContext:
 
 @dataclass
 class ActiveRequest:
+    """Per-request execution/model state owned by the scheduler."""
+
     request: InferenceRequest
     generated_tokens: int = 0
     output_text: str = ""

@@ -4,8 +4,8 @@ import time
 import torch
 
 from typing import List
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from .model import load_model_bundle
 from .types import (
     ActiveRequest,
     InferenceRequest,
@@ -16,10 +16,9 @@ from .types import (
 
 
 class MiniInferenceEngine:
-    def __init__(self, max_requests, batch_size=1):
+    def __init__(self, max_requests, batch_size=1, model_name=None):
         self.batch_size = batch_size
         self.max_wait_time = 0.05
-        self.decode_step_time = 0.05
         self._request_id_gen = itertools.count(1)
 
         self.pending = asyncio.Queue(max_requests)
@@ -33,29 +32,11 @@ class MiniInferenceEngine:
         self.rejected_total = 0
         self.decode_ticks_total = 0
 
-        if torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
-        model_name = "Qwen/Qwen2.5-3B-Instruct"
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-        )
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16 if self.device.type == "mps" else torch.float32,
-            trust_remote_code=True,
-        ).to(self.device)
-
-        self.model.eval()
-
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        bundle = load_model_bundle(model_name) if model_name else load_model_bundle()
+        self.tokenizer = bundle.tokenizer
+        self.model = bundle.model
+        self.device = bundle.device
+        self.model_name = bundle.model_name
 
     async def start(self):
         if self.scheduler_task is not None and not self.scheduler_task.done():
@@ -133,7 +114,7 @@ class MiniInferenceEngine:
                 await self._admit_new_requests(initial_fill=False)
 
             self._remove_cancelled_requests()
-            await self._run_prefill_or_decode_step()
+            await self._run_generation_step()
             self._finalize_finished_requests()
 
     async def _maybe_wait_for_first_request(self):
@@ -172,6 +153,14 @@ class MiniInferenceEngine:
             self.active_slots.append(ActiveRequest(request=request))
             print(f"[ADMIT] request {request.request_id} admitted")
 
+    def _pick_next_token_id(self, next_token_logits):
+        return torch.argmax(next_token_logits, dim=-1)
+
+    def _pick_next_token_id_sampling(self, next_token_logits):
+        probs = torch.softmax(next_token_logits / 0.8, dim=-1)
+        next_token_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        return next_token_id
+
     async def _run_prefill_for_request(self, active_r, ctx):
         # prompt = active_r.request.prompt
         # inputs = self.tokenizer(prompt, return_tensors="pt")
@@ -200,8 +189,7 @@ class MiniInferenceEngine:
             )
 
         next_token_logits = outputs.logits[:, -1, :]  # (B, T, C) -> (B, C)
-        probs = torch.softmax(next_token_logits / 0.8, dim=-1)
-        next_token_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        next_token_id = self._pick_next_token_id(next_token_logits)
 
         active_r.past_key_values = outputs.past_key_values
         active_r.last_token_id = next_token_id
@@ -223,7 +211,7 @@ class MiniInferenceEngine:
             )
 
         next_token_logits = outputs.logits[:, -1, :]
-        next_token_id = torch.argmax(next_token_logits, dim=-1)
+        next_token_id = self._pick_next_token_id(next_token_logits)
 
         active_r.past_key_values = outputs.past_key_values
         active_r.last_token_id = next_token_id
@@ -233,7 +221,7 @@ class MiniInferenceEngine:
         active_r.generated_tokens += 1
         ctx.token_queue.put_nowait(generated_token)
 
-    async def _run_prefill_or_decode_step(self):
+    async def _run_generation_step(self):
         if not self.active_slots:
             return
 
@@ -294,6 +282,7 @@ class MiniInferenceEngine:
                     completion_time=completion_time,
                     batching_delay=service_start_time - r.arrival_time,
                     processing_delay=completion_time - service_start_time,
+                    generated_tokens=active_r.generated_tokens,
                 )
             )
 

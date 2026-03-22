@@ -23,6 +23,7 @@ class GenerateResponse(BaseModel):
     completion_time: float
     batching_delay: float
     processing_delay: float
+    generated_tokens: int
 
 
 max_request = 10
@@ -58,6 +59,7 @@ async def generate(req: GenerateRequest):
         completion_time=res.completion_time,
         batching_delay=res.batching_delay,
         processing_delay=res.processing_delay,
+        generated_tokens=res.generated_tokens,
     )
 
 
@@ -88,7 +90,12 @@ async def generate_stream(req: GenerateRequest, request: Request):
 
             if not disconnected:
                 result = await ctx.future
-                yield f"data: {json.dumps({'done': True, 'request_id': result.request_id, 'finish_reason': result.finish_reason})}\n\n"
+                yield f"data: {json.dumps({
+                    'done': True,
+                    'request_id': result.request_id,
+                    'finish_reason': result.finish_reason,
+                    'generated_tokens': result.generated_tokens,
+                })}\n\n"
 
         except Exception:
             engine.cancel_request(ctx.request_id)
