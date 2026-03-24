@@ -111,6 +111,7 @@ class ToyTokenizer:
             raise ValueError(f"unsupported return_tensors: {return_tensors}")
 
         return {
+            # input_ids / attention_mask: [batch, seq_len]
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         }
@@ -135,7 +136,7 @@ class ToyTokenizer:
         return "".join(pieces)
 
 
-class MHA(nn.Module):
+class MultiHeadAttention(nn.Module):
     def __init__(self, d_embed: int, n_head: int = 8, dropout: float = 0.0) -> None:
         super().__init__()
         if d_embed % n_head != 0:
@@ -152,10 +153,12 @@ class MHA(nn.Module):
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
+        # [B, T, C] -> [B, H, T, D]
         return x.view(bsz, seq_len, self.n_head, self.head_dim).transpose(1, 2).contiguous()
 
     def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
         bsz, _, seq_len, _ = x.shape
+        # [B, H, T, D] -> [B, T, C]
         return x.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_embed)
 
     def _build_causal_mask(self, query_len: int, total_len: int, past_len: int, device: torch.device) -> torch.Tensor:
@@ -173,6 +176,8 @@ class MHA(nn.Module):
         layer_past: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
     ):
+        # x: [B, T_new, C]
+        # layer_past: each tensor [B, H, T_cache, D]
         q = self._split_heads(self.q(x))
         k = self._split_heads(self.k(x))
         v = self._split_heads(self.v(x))
@@ -183,7 +188,9 @@ class MHA(nn.Module):
             past_len = past_k.size(2)
             k = torch.cat([past_k, k], dim=2)
             v = torch.cat([past_v, v], dim=2)
+            # k / v are now [B, H, T_cache + T_new, D]
 
+        # scores: [B, H, T_new, T_total]
         scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
         causal_mask = self._build_causal_mask(
             query_len=q.size(2),
@@ -203,7 +210,7 @@ class MHA(nn.Module):
 
         att = F.softmax(scores, dim=-1)
         att = self.dropout(att)
-        out = att @ v
+        out = att @ v  # [B, H, T_new, D]
         out = self._merge_heads(out)
         out = self.output(out)
         out = self.dropout(out)
@@ -212,7 +219,7 @@ class MHA(nn.Module):
         return out, present
 
 
-class MLP(nn.Module):
+class FeedForward(nn.Module):
     def __init__(self, d_embed: int, dropout: float = 0.0):
         super().__init__()
         self.l1 = nn.Linear(d_embed, 4 * d_embed)
@@ -228,9 +235,9 @@ class TransformerBlock(nn.Module):
     def __init__(self, d_embed: int, n_head: int, dropout: float):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_embed)
-        self.mha = MHA(d_embed, n_head=n_head, dropout=dropout)
+        self.attn = MultiHeadAttention(d_embed, n_head=n_head, dropout=dropout)
         self.ln2 = nn.LayerNorm(d_embed)
-        self.mlp = MLP(d_embed, dropout=dropout)
+        self.ffn = FeedForward(d_embed, dropout=dropout)
 
     def forward(
         self,
@@ -239,14 +246,14 @@ class TransformerBlock(nn.Module):
         layer_past: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
     ):
-        attn_out, present = self.mha(
+        attn_out, present = self.attn(
             self.ln1(x),
             attention_mask=attention_mask,
             layer_past=layer_past,
             use_cache=use_cache,
         )
         x = x + attn_out
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.ffn(self.ln2(x))
         return x, present
 
 
@@ -342,9 +349,11 @@ class ToyGPTForCausalLM(nn.Module):
                 "increase max_seq_length for longer prompts"
             )
 
-        token_embed = self.token_embedding(input_ids)
-        pos_embed = self.pos_embedding(position_ids)
-        x = token_embed + pos_embed
+        # input_ids:   [B, T_new]
+        # position_ids:[B, T_new]
+        token_embed = self.token_embedding(input_ids)   # [B, T_new, C]
+        pos_embed = self.pos_embedding(position_ids)    # [B, T_new, C]
+        x = token_embed + pos_embed                     # [B, T_new, C]
 
         presents = []
         for layer, layer_past in zip(self.layers, normalized_past):
@@ -358,7 +367,7 @@ class ToyGPTForCausalLM(nn.Module):
                 presents.append(present)
 
         x = self.ln(x)
-        logits = self.linear(x)
+        logits = self.linear(x)  # [B, T_new, vocab_size]
 
         return ToyCausalLMOutput(
             logits=logits,

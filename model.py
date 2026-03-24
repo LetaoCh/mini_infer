@@ -59,21 +59,25 @@ def _load_hf_model_bundle(model_name: str, device: torch.device) -> ModelBundle:
     )
 
 
+def _load_toy_checkpoint_bundle(checkpoint_path: str, device: torch.device) -> ModelBundle:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    config = ToyGPTConfig(**checkpoint["config"])
+    tokenizer = ToyTokenizer(max_seq_length=config.max_seq_length)
+    model = ToyGPTForCausalLM(config).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    return ModelBundle(
+        tokenizer=tokenizer,
+        model=model,
+        device=device,
+        model_name=checkpoint_path,
+    )
+
+
 def _load_toy_model_bundle(model_name: str | None, device: torch.device) -> ModelBundle:
     if model_name and os.path.exists(model_name):
-        checkpoint = torch.load(model_name, map_location=device)
-        config = ToyGPTConfig(**checkpoint["config"])
-        tokenizer = ToyTokenizer(max_seq_length=config.max_seq_length)
-        model = ToyGPTForCausalLM(config).to(device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()
-
-        return ModelBundle(
-            tokenizer=tokenizer,
-            model=model,
-            device=device,
-            model_name=model_name,
-        )
+        return _load_toy_checkpoint_bundle(model_name, device)
 
     toy_bundle = build_toy_model_bundle(device=device)
     return ModelBundle(
@@ -82,6 +86,7 @@ def _load_toy_model_bundle(model_name: str | None, device: torch.device) -> Mode
         device=toy_bundle.device,
         model_name=model_name or DEFAULT_TOY_MODEL_NAME,
     )
+
 
 def _load_practice_model_bundle(model_name: str | None, device: torch.device) -> ModelBundle:
     practice_bundle = build_practice_model_bundle(model_name=model_name, device=device)

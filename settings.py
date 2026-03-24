@@ -34,8 +34,12 @@ PROFILE_PRESETS: dict[str, AppSettings] = {
 }
 
 
+def _get_env_str(name: str, default: str) -> str:
+    return os.getenv(name, default).strip()
+
+
 def _load_profile_defaults() -> AppSettings:
-    profile_name = os.getenv("SERVER_PROFILE", "balanced").strip().lower()
+    profile_name = _get_env_str("SERVER_PROFILE", "balanced").lower()
     if not profile_name:
         return AppSettings()
 
@@ -50,11 +54,11 @@ def load_app_settings() -> AppSettings:
     base = _load_profile_defaults()
     return AppSettings(
         server_profile=base.server_profile,
-        max_requests=int(os.getenv("MAX_REQUESTS", str(base.max_requests))),
-        batch_size=int(os.getenv("BATCH_SIZE", str(base.batch_size))),
-        model_backend=os.getenv("MODEL_BACKEND", base.model_backend),
+        max_requests=int(_get_env_str("MAX_REQUESTS", str(base.max_requests))),
+        batch_size=int(_get_env_str("BATCH_SIZE", str(base.batch_size))),
+        model_backend=_get_env_str("MODEL_BACKEND", base.model_backend),
         model_name=os.getenv("MODEL_NAME") or base.model_name,
-        prefill_mode=os.getenv("PREFILL_MODE", base.prefill_mode),
-        decode_mode=os.getenv("DECODE_MODE", base.decode_mode),
-        tick_log_every=max(1, int(os.getenv("TICK_LOG_EVERY", str(base.tick_log_every)))),
+        prefill_mode=_get_env_str("PREFILL_MODE", base.prefill_mode),
+        decode_mode=_get_env_str("DECODE_MODE", base.decode_mode),
+        tick_log_every=max(1, int(_get_env_str("TICK_LOG_EVERY", str(base.tick_log_every)))),
     )

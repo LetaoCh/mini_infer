@@ -5,6 +5,18 @@ Small continuous-batching inference playground with two model backends:
 - `hf`: real Hugging Face causal LMs like Qwen
 - `toy`: a small local GPT for learning and experimentation
 
+## Suggested Reading Order
+
+If you are using this repo to learn, read the files in this order:
+
+1. `app.py`: FastAPI endpoints and where requests enter the system
+2. `engine.py`: request scheduling, batching, prefill, decode, and completion
+3. `model.py`: how model backends are selected and loaded
+4. `models/gpt_full.py`: the toy model used by the server and training scripts
+5. `training/train_toy.py`: plain next-token training loop
+6. `training/train_toy_sft.py`: supervised fine-tuning with masked labels
+7. `models/gpt.py`: a smaller practice implementation for experimentation
+
 ## Repo Layout
 
 - root: app runtime and package modules

@@ -53,6 +53,7 @@ def load_tokens(text_path: Path, tokenizer: ToyTokenizer) -> torch.Tensor:
     token_ids = tokenizer.encode(text)
     if len(token_ids) < 2:
         raise ValueError("training corpus is too short; need at least 2 tokens")
+    # tokens: [num_tokens]
     return torch.tensor(token_ids, dtype=torch.long)
 
 
@@ -73,6 +74,8 @@ def get_batch(data: torch.Tensor, batch_size: int, seq_len: int, device: torch.d
     else:
         starts = torch.randint(0, max_start + 1, (batch_size,))
 
+    # x: current tokens, y: next-token targets
+    # x / y: [batch_size, seq_len]
     x = torch.stack([data[i : i + seq_len] for i in starts.tolist()])
     y = torch.stack([data[i + 1 : i + seq_len + 1] for i in starts.tolist()])
     return x.to(device), y.to(device)
@@ -80,8 +83,9 @@ def get_batch(data: torch.Tensor, batch_size: int, seq_len: int, device: torch.d
 
 def compute_loss(model: ToyGPTForCausalLM, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     outputs = model(input_ids=x, use_cache=False)
-    logits = outputs.logits
+    logits = outputs.logits  # [B, T, vocab_size]
     vocab_size = logits.size(-1)
+    # Flatten batch and time so cross-entropy sees one row per token position.
     return F.cross_entropy(logits.reshape(-1, vocab_size), y.reshape(-1))
 
 
@@ -120,13 +124,14 @@ def generate_sample(
     if not prompt_ids:
         prompt_ids = [tokenizer.bos_token_id]
 
-    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)  # [1, prompt_len]
     outputs = model(input_ids=input_ids, use_cache=True)
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = [int(next_token.item())]
     past_key_values = outputs.past_key_values
 
     for _ in range(max_new_tokens - 1):
+        # After the first full prompt pass, decode one token at a time from cache.
         outputs = model(
             input_ids=next_token,
             past_key_values=past_key_values,
@@ -238,8 +243,8 @@ def main():
 
     model.train()
     for step in range(start_step + 1, args.steps + 1):
-        x, y = get_batch(train_data, args.batch_size, config.max_seq_length, device)
-        loss = compute_loss(model, x, y)
+        input_ids, target_ids = get_batch(train_data, args.batch_size, config.max_seq_length, device)
+        loss = compute_loss(model, input_ids, target_ids)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()

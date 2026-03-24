@@ -10,17 +10,22 @@ from .schemas import GenerateRequest, GenerateResponse
 from .settings import load_app_settings
 from .state import OverloadedError
 
-settings = load_app_settings()
-engine = MiniInferenceEngine(
-    settings.max_requests,
-    batch_size=settings.batch_size,
-    model_backend=settings.model_backend,
-    model_name=settings.model_name,
-    server_profile=settings.server_profile,
-    prefill_mode=settings.prefill_mode,
-    decode_mode=settings.decode_mode,
-    tick_log_every=settings.tick_log_every,
-)
+
+def build_engine() -> MiniInferenceEngine:
+    settings = load_app_settings()
+    return MiniInferenceEngine(
+        settings.max_requests,
+        batch_size=settings.batch_size,
+        model_backend=settings.model_backend,
+        model_name=settings.model_name,
+        server_profile=settings.server_profile,
+        prefill_mode=settings.prefill_mode,
+        decode_mode=settings.decode_mode,
+        tick_log_every=settings.tick_log_every,
+    )
+
+
+engine = build_engine()
 
 
 @asynccontextmanager
@@ -83,6 +88,7 @@ async def generate_stream(req: GenerateRequest, request: Request):
                 yield f"data: {json.dumps({'token': token})}\n\n"
 
             if not disconnected:
+                # Once token streaming is done, send one final summary event.
                 result = await ctx.future
                 yield f"data: {json.dumps({
                     'done': True,

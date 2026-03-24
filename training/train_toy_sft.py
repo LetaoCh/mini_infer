@@ -91,10 +91,12 @@ def build_sft_example(messages, tokenizer: ToyTokenizer, max_seq_length: int):
         newline_ids = tokenizer.encode("\n")
 
         input_ids.extend(prefix_ids)
+        # We never train on the "User: " / "Assistant: " role prefix itself.
         labels.extend([IGNORE_INDEX] * len(prefix_ids))
 
         input_ids.extend(content_ids)
         if message["role"] == "assistant":
+            # Only assistant tokens count toward the SFT loss.
             labels.extend(content_ids)
         else:
             labels.extend([IGNORE_INDEX] * len(content_ids))
@@ -109,6 +111,7 @@ def build_sft_example(messages, tokenizer: ToyTokenizer, max_seq_length: int):
     labels.append(tokenizer.eos_token_id)
 
     if len(input_ids) > max_seq_length:
+        # Keep the tail because the assistant answer is usually near the end.
         input_ids = input_ids[-max_seq_length:]
         labels = labels[-max_seq_length:]
 
@@ -149,9 +152,9 @@ def get_batch(data, batch_size: int, seq_len: int, tokenizer: ToyTokenizer, devi
         batch_labels.append(labels + [IGNORE_INDEX] * pad_len)
         attention_masks.append([1] * len(input_ids) + [0] * pad_len)
 
-    x = torch.tensor(batch_input_ids, dtype=torch.long, device=device)
-    y = torch.tensor(batch_labels, dtype=torch.long, device=device)
-    attention_mask = torch.tensor(attention_masks, dtype=torch.long, device=device)
+    x = torch.tensor(batch_input_ids, dtype=torch.long, device=device)          # [B, T]
+    y = torch.tensor(batch_labels, dtype=torch.long, device=device)             # [B, T]
+    attention_mask = torch.tensor(attention_masks, dtype=torch.long, device=device)  # [B, T]
     return x, y, attention_mask
 
 
@@ -160,8 +163,8 @@ def compute_loss(
 ) -> torch.Tensor:
     outputs = model(input_ids=x, attention_mask=attention_mask, use_cache=False)
     logits = outputs.logits
-    shifted_logits = logits[:, :-1, :].contiguous()
-    shifted_labels = y[:, 1:].contiguous()
+    shifted_logits = logits[:, :-1, :].contiguous()   # [B, T-1, vocab_size]
+    shifted_labels = y[:, 1:].contiguous()            # [B, T-1]
     vocab_size = shifted_logits.size(-1)
     return F.cross_entropy(
         shifted_logits.reshape(-1, vocab_size),
@@ -191,7 +194,7 @@ def generate_sample(model, tokenizer: ToyTokenizer, prompt: str, max_new_tokens:
     if not prompt_ids:
         prompt_ids = [tokenizer.bos_token_id]
 
-    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)  # [1, prompt_len]
     outputs = model(input_ids=input_ids, use_cache=True)
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
     generated = [int(next_token.item())]
@@ -305,8 +308,14 @@ def main():
 
     model.train()
     for step in range(start_step + 1, args.steps + 1):
-        x, y, attention_mask = get_batch(train_data, args.batch_size, config.max_seq_length, tokenizer, device)
-        loss = compute_loss(model, x, y, attention_mask)
+        input_ids, labels, attention_mask = get_batch(
+            train_data,
+            args.batch_size,
+            config.max_seq_length,
+            tokenizer,
+            device,
+        )
+        loss = compute_loss(model, input_ids, labels, attention_mask)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()

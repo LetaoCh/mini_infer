@@ -11,6 +11,14 @@ import torch.nn.functional as F
 DEFAULT_MAX_SEQ_LENGTH = 64
 
 
+def pick_device() -> torch.device:
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 @dataclass
 class GPTConfig:
     vocab_size: int = 1000
@@ -140,6 +148,7 @@ class PracticeTokenizer:
             raise ValueError(f"unsupported return_tensors: {return_tensors}")
 
         return {
+            # input_ids / attention_mask: [batch, seq_len]
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         }
@@ -189,24 +198,26 @@ class MultiHeadSelfAttention(nn.Module):
         past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-        # x: (B, T, C)
+        # x: [B, T_new, C]
+        # past_kv: each tensor [B, H, T_cache, D]
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
 
-        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
-        k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
-        v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
+        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)  # [B, H, T_new, D]
+        k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)  # [B, H, T_new, D]
+        v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)  # [B, H, T_new, D]
 
         if past_kv is not None:
             past_k, past_v = past_kv
             k = torch.cat([past_k, k], dim=2)
             v = torch.cat([past_v, v], dim=2)
+            # k / v are now [B, H, T_cache + T_new, D]
 
         present_kv = (k, v) if use_cache else None
 
         q_len = q.size(2)
         k_len = k.size(2)
-        att_scores = (q @ k.transpose(-2, -1)) / math.sqrt(D)  # (B, H, q_len, k_len)
+        att_scores = (q @ k.transpose(-2, -1)) / math.sqrt(D)  # [B, H, T_new, T_total]
 
         # During cached decode q_len is typically 1, and the query corresponds to the newest token,
         # so it may attend to all cached keys and itself. For prefill/full-sequence forward, use causal mask.
@@ -217,8 +228,8 @@ class MultiHeadSelfAttention(nn.Module):
         att_weights = F.softmax(att_scores, dim=-1)
         att_weights = self.dropout(att_weights)
 
-        out = att_weights @ v  # (B, H, q_len, D)
-        out = out.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
+        out = att_weights @ v  # [B, H, T_new, D]
+        out = out.transpose(1, 2).contiguous().view(B, T, C)  # [B, T_new, C]
         out = self.out_proj(out)
         out = self.dropout(out)
         return out, present_kv
@@ -279,7 +290,7 @@ class GPT(nn.Module):
         past_key_values: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[tuple[torch.Tensor, torch.Tensor] | None]]:
-        # idx: (B, T)
+        # idx: [B, T_new]
         B, T = idx.shape
         assert T <= self.config.max_seq_length, "sequence too long"
 
@@ -293,9 +304,9 @@ class GPT(nn.Module):
         assert past_length + T <= self.config.max_seq_length, "cache + input exceeds max_seq_length"
 
         positions = torch.arange(past_length, past_length + T, device=idx.device)
-        tok_emb = self.token_embedding(idx)        # (B, T, C)
-        pos_emb = self.pos_embedding(positions)    # (T, C)
-        x = tok_emb + pos_emb                      # (B, T, C)
+        tok_emb = self.token_embedding(idx)        # [B, T_new, C]
+        pos_emb = self.pos_embedding(positions)    # [T_new, C]
+        x = tok_emb + pos_emb                      # [B, T_new, C]
 
         present_key_values = []
         for i, block in enumerate(self.blocks):
@@ -303,7 +314,7 @@ class GPT(nn.Module):
             present_key_values.append(present_kv)
 
         x = self.final_ln(x)
-        logits = self.lm_head(x)                  # (B, T, V)
+        logits = self.lm_head(x)                  # [B, T_new, vocab_size]
 
         loss = None
         if targets is not None:
@@ -316,6 +327,7 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def prefill(self, idx: torch.Tensor) -> PrefillOutput:
+        # idx: [B, prompt_len]
         logits, _, past_key_values = self(idx, past_key_values=None, use_cache=True)
         return PrefillOutput(logits=logits, past_key_values=past_key_values)  # type: ignore[arg-type]
 
@@ -326,6 +338,7 @@ class GPT(nn.Module):
         past_key_values: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> DecodeOutput:
         assert idx.shape[1] == 1, "decode expects exactly one token"
+        # idx: [B, 1]
         logits, _, new_past_key_values = self(idx, past_key_values=past_key_values, use_cache=True)
         return DecodeOutput(logits=logits, past_key_values=new_past_key_values)  # type: ignore[arg-type]
 
@@ -336,6 +349,7 @@ class GPT(nn.Module):
         if max_new_tokens <= 0:
             return idx
 
+        # First run the full prompt once to build the KV cache.
         prefill_output = self.prefill(idx)
         next_token_logits = prefill_output.logits[:, -1, :]
         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
@@ -343,6 +357,7 @@ class GPT(nn.Module):
         past_key_values = prefill_output.past_key_values
 
         for _ in range(max_new_tokens - 1):
+            # After prefill, decode one token at a time using the cache.
             decode_output = self.decode(next_token, past_key_values)
             next_token_logits = decode_output.logits[:, -1, :]
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
@@ -383,12 +398,7 @@ def build_practice_model_bundle(
     device: torch.device | None = None,
 ) -> PracticeModelBundle:
     if device is None:
-        if torch.backends.mps.is_available():
-            device = torch.device("mps")
-        elif torch.cuda.is_available():
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cpu")
+        device = pick_device()
 
     if model_name and os.path.exists(model_name):
         checkpoint = torch.load(model_name, map_location=device)
@@ -430,9 +440,9 @@ def set_seed(seed: int = 0) -> None:
 
 
 def get_batch(data: torch.Tensor, batch_size: int, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    # data: (N,)
+    # data: [num_tokens]
     ix = torch.randint(0, len(data) - seq_len, (batch_size,), device=device)
-    x = torch.stack([data[i : i + seq_len] for i in ix])
+    x = torch.stack([data[i : i + seq_len] for i in ix])      # [B, T]
     y = x.clone()
     return x, y
 
@@ -506,12 +516,7 @@ def main() -> None:
     )
     generation_config = GenerationConfig(max_new_tokens=10, crop_context=True)
 
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+    device = pick_device()
 
     model = GPT(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)

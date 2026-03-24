@@ -45,5 +45,5 @@ class ActiveRequest:
     generated_tokens: int = 0
     output_text: str = ""
     past_key_values: Any = None
-    last_token_id: Optional[torch.Tensor] = None
+    last_token_id: Optional[torch.Tensor] = None  # usually shape [1]
     prefill_done: bool = False

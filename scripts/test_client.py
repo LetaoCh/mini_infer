@@ -6,7 +6,7 @@ import httpx
 
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 TIMEOUT = 30.0
-REQUESTS = [
+DEFAULT_REQUESTS = [
     ("What is batching?", 12),
     ("Explain speculative decoding briefly.", 18),
     ("Write a haiku about GPUs.", 10),
@@ -86,8 +86,8 @@ async def send_one(client: httpx.AsyncClient, base_url: str, index: int, prompt:
 def load_requests(prompts_file: str | None, max_new_tokens: int | None):
     if prompts_file is None:
         if max_new_tokens is None:
-            return REQUESTS
-        return [(prompt, max_new_tokens) for prompt, _tokens in REQUESTS]
+            return DEFAULT_REQUESTS
+        return [(prompt, max_new_tokens) for prompt, _tokens in DEFAULT_REQUESTS]
 
     prompts = []
     with open(prompts_file, "r", encoding="utf-8") as f:
@@ -102,14 +102,14 @@ def load_requests(prompts_file: str | None, max_new_tokens: int | None):
 
 async def main():
     args = parse_args()
-    requests = load_requests(args.prompts_file, args.max_new_tokens)
+    request_specs = load_requests(args.prompts_file, args.max_new_tokens)
 
     async with httpx.AsyncClient(timeout=args.timeout) as client:
         await fetch_stats(client, args.base_url, "before")
 
         tasks = [
             send_one(client, args.base_url, index, prompt, max_new_tokens)
-            for index, (prompt, max_new_tokens) in enumerate(requests, start=1)
+            for index, (prompt, max_new_tokens) in enumerate(request_specs, start=1)
         ]
         await asyncio.gather(*tasks)
 
