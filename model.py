@@ -7,12 +7,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     from .models.gpt_full import ToyGPTConfig, ToyGPTForCausalLM, ToyTokenizer, build_toy_model_bundle
+    from .models.gpt import build_practice_model_bundle
 except ImportError:
     from models.gpt_full import ToyGPTConfig, ToyGPTForCausalLM, ToyTokenizer, build_toy_model_bundle
+    from models.gpt import build_practice_model_bundle
 
 DEFAULT_MODEL_BACKEND = "hf"
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 DEFAULT_TOY_MODEL_NAME = "toy-gpt"
+DEFAULT_PRACTICE_MODEL_NAME = "practice-gpt"
 
 
 @dataclass
@@ -80,6 +83,15 @@ def _load_toy_model_bundle(model_name: str | None, device: torch.device) -> Mode
         model_name=model_name or DEFAULT_TOY_MODEL_NAME,
     )
 
+def _load_practice_model_bundle(model_name: str | None, device: torch.device) -> ModelBundle:
+    practice_bundle = build_practice_model_bundle(model_name=model_name, device=device)
+    return ModelBundle(
+        tokenizer=practice_bundle.tokenizer,
+        model=practice_bundle.model,
+        device=practice_bundle.device,
+        model_name=practice_bundle.model_name,
+    )
+
 
 def load_model_bundle(
     model_name: str | None = None,
@@ -91,5 +103,7 @@ def load_model_bundle(
         return _load_hf_model_bundle(model_name or DEFAULT_MODEL_NAME, device)
     if model_backend == "toy":
         return _load_toy_model_bundle(model_name, device)
+    if model_backend == "practice":
+        return _load_practice_model_bundle(model_name, device)
 
     raise ValueError(f"invalid model_backend: {model_backend}")

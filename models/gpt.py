@@ -1,4 +1,5 @@
 import math
+import os
 import random
 from dataclasses import dataclass
 
@@ -7,10 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+DEFAULT_MAX_SEQ_LENGTH = 64
+
+
 @dataclass
 class GPTConfig:
     vocab_size: int = 1000
-    max_seq_length: int = 64
+    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH
     d_embed: int = 128
     n_layers: int = 4
     n_heads: int = 4
@@ -42,6 +46,122 @@ class PrefillOutput:
 class DecodeOutput:
     logits: torch.Tensor
     past_key_values: list[tuple[torch.Tensor, torch.Tensor]]
+
+
+@dataclass
+class PracticeModelBundle:
+    tokenizer: "PracticeTokenizer"
+    model: "GPT"
+    device: torch.device
+    model_name: str
+
+
+class PracticeTokenizer:
+    def __init__(self, vocab_size: int = 1000, max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH):
+        if vocab_size < 4:
+            raise ValueError("vocab_size must be at least 4")
+
+        special_tokens = ["<pad>", "<bos>", "<eos>", "<unk>"]
+        base_chars = [chr(i) for i in range(32, 127)] + ["\n", "\t"]
+        extra_slots = max(0, vocab_size - len(special_tokens) - len(base_chars))
+        extra_tokens = [f"<tok_{i}>" for i in range(extra_slots)]
+
+        self.tokens = special_tokens + base_chars + extra_tokens
+        self.token_to_id = {token: idx for idx, token in enumerate(self.tokens)}
+        self.id_to_token = {idx: token for token, idx in self.token_to_id.items()}
+
+        self.pad_token = "<pad>"
+        self.bos_token = "<bos>"
+        self.eos_token = "<eos>"
+        self.unk_token = "<unk>"
+
+        self.pad_token_id = self.token_to_id[self.pad_token]
+        self.bos_token_id = self.token_to_id[self.bos_token]
+        self.eos_token_id = self.token_to_id[self.eos_token]
+        self.unk_token_id = self.token_to_id[self.unk_token]
+        self.max_seq_length = max_seq_length
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.tokens)
+
+    def apply_chat_template(self, messages, tokenize: bool = False, add_generation_prompt: bool = True):
+        lines = []
+        for message in messages:
+            role = message.get("role", "user").strip().capitalize()
+            content = message.get("content", "")
+            lines.append(f"{role}: {content}")
+        if add_generation_prompt:
+            lines.append("Assistant:")
+        text = "\n".join(lines)
+
+        if tokenize:
+            return self._encode_text(text)
+        return text
+
+    def _encode_text(self, text: str) -> list[int]:
+        return [self.token_to_id.get(ch, self.unk_token_id) for ch in text]
+
+    def encode(self, text: str) -> list[int]:
+        return self._encode_text(text)
+
+    def __call__(
+        self,
+        texts,
+        return_tensors: str = "pt",
+        padding: bool = False,
+        truncation: bool = True,
+    ):
+        if isinstance(texts, str):
+            texts = [texts]
+
+        encoded = []
+        for text in texts:
+            token_ids = self._encode_text(text)
+            if truncation:
+                token_ids = token_ids[: self.max_seq_length]
+            encoded.append(token_ids)
+
+        if not encoded:
+            raise ValueError("expected at least one text input")
+
+        target_len = max(len(token_ids) for token_ids in encoded)
+        if not padding and len(texts) == 1:
+            target_len = len(encoded[0])
+
+        input_ids = []
+        attention_mask = []
+        for token_ids in encoded:
+            pad_len = target_len - len(token_ids)
+            input_ids.append(token_ids + [self.pad_token_id] * pad_len)
+            attention_mask.append([1] * len(token_ids) + [0] * pad_len)
+
+        if return_tensors != "pt":
+            raise ValueError(f"unsupported return_tensors: {return_tensors}")
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        }
+
+    def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.detach().cpu().view(-1).tolist()
+        elif isinstance(token_ids, int):
+            token_ids = [token_ids]
+
+        pieces = []
+        for token_id in token_ids:
+            token = self.id_to_token.get(int(token_id), self.unk_token)
+            if skip_special_tokens and token in {
+                self.pad_token,
+                self.bos_token,
+                self.eos_token,
+                self.unk_token,
+            }:
+                continue
+            pieces.append("" if token.startswith("<tok_") else token)
+        return "".join(pieces)
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -250,6 +370,57 @@ class GPT(nn.Module):
             idx = torch.cat([idx, next_token], dim=1)
         return idx
 
+
+def build_practice_model_bundle(
+    *,
+    model_name: str | None = None,
+    vocab_size: int = 1000,
+    d_embed: int = 256,
+    n_layers: int = 4,
+    n_head: int = 8,
+    dropout: float = 0.0,
+    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
+    device: torch.device | None = None,
+) -> PracticeModelBundle:
+    if device is None:
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+
+    if model_name and os.path.exists(model_name):
+        checkpoint = torch.load(model_name, map_location=device)
+        config = GPTConfig(**checkpoint["config"])
+        tokenizer = PracticeTokenizer(
+            vocab_size=config.vocab_size,
+            max_seq_length=config.max_seq_length,
+        )
+        model = GPT(config).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        resolved_model_name = model_name
+    else:
+        tokenizer = PracticeTokenizer(vocab_size=vocab_size, max_seq_length=max_seq_length)
+        config = GPTConfig(
+            vocab_size=tokenizer.vocab_size,
+            d_embed=d_embed,
+            n_layers=n_layers,
+            n_heads=n_head,
+            dropout=dropout,
+            max_seq_length=max_seq_length,
+        )
+        model = GPT(config).to(device)
+        resolved_model_name = model_name or "practice-gpt"
+
+    model.eval()
+
+    return PracticeModelBundle(
+        tokenizer=tokenizer,
+        model=model,
+        device=device,
+        model_name=resolved_model_name,
+    )
 
 def set_seed(seed: int = 0) -> None:
     random.seed(seed)
