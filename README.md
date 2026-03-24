@@ -31,7 +31,7 @@ PYTHONPATH=.. MODEL_BACKEND=toy .venv/bin/python -m uvicorn mini_infer.app:app
 Toy model from a trained checkpoint:
 
 ```bash
-PYTHONPATH=.. MODEL_BACKEND=toy MODEL_NAME=checkpoints/toy-gpt.pt \
+PYTHONPATH=.. MODEL_BACKEND=toy MODEL_NAME=checkpoints/toy-gpt-d256-l4-h8-seq256-step120k.pt \
 .venv/bin/python -m uvicorn mini_infer.app:app
 ```
 
@@ -51,7 +51,7 @@ Quick start on Apple Silicon:
   --d-embed 256 \
   --n-layers 4 \
   --n-head 8 \
-  --out checkpoints/toy-gpt.pt
+  --out checkpoints/toy-gpt-d256-l4-h8-seq256.pt
 ```
 
 Larger but still practical config for an M1 Ultra:
@@ -66,7 +66,7 @@ Larger but still practical config for an M1 Ultra:
   --d-embed 512 \
   --n-layers 6 \
   --n-head 8 \
-  --out checkpoints/toy-gpt-512d.pt
+  --out checkpoints/toy-gpt-d512-l6-h8-seq256.pt
 ```
 
 If MPS memory gets tight, drop `--batch-size` to `16`.
@@ -79,17 +79,90 @@ Resume a longer run:
   --device mps \
   --steps 10000 \
   --batch-size 32 \
-  --resume checkpoints/toy-gpt.pt \
-  --out checkpoints/toy-gpt.pt
+  --resume checkpoints/toy-gpt-d256-l4-h8-seq256.pt \
+  --out checkpoints/toy-gpt-d256-l4-h8-seq256.pt
 ```
 
-A full run:
+A full overnight run:
 
 ```bash
-.venv/bin/python train_toy.py \
+.venv/bin/python -m training.train_toy \
   --text-file data/generated/tinystories_train.txt \
   --device mps \
-  --steps 30000 \
+  --steps 120000 \
+  --batch-size 32 \
+  --seq-len 256 \
+  --d-embed 256 \
+  --n-layers 4 \
+  --n-head 8 \
+  --eval-every 500 \
+  --eval-batches 10 \
+  --sample-every 2000 \
+  --sample-tokens 120 \
+  --out checkpoints/toy-gpt-d256-l4-h8-seq256-step120k.pt
+```
+
+Aggressive 10-hour run on an M1 Ultra:
+
+Use this if you want the strongest practical pretrain run, not just the biggest model:
+
+```bash
+.venv/bin/python -m training.train_toy \
+  --text-file data/generated/tinystories_train_full.txt \
+  --device mps \
+  --steps 80000 \
+  --batch-size 4 \
+  --seq-len 256 \
+  --d-embed 1280 \
+  --n-layers 16 \
+  --n-head 20 \
+  --eval-every 500 \
+  --eval-batches 10 \
+  --sample-every 2000 \
+  --sample-tokens 120 \
+  --out checkpoints/toy-gpt-d1280-l16-h20-seq256-step80k.pt
+```
+
+Max 10-hour run I would try on this setup:
+
+Use this if you want to push the machine harder and are willing to trade some training efficiency for a larger model:
+
+```bash
+.venv/bin/python -m training.train_toy \
+  --text-file data/generated/tinystories_train_full.txt \
+  --device mps \
+  --steps 50000 \
+  --batch-size 2 \
+  --seq-len 256 \
+  --d-embed 1536 \
+  --n-layers 18 \
+  --n-head 24 \
+  --eval-every 500 \
+  --eval-batches 10 \
+  --sample-every 2000 \
+  --sample-tokens 120 \
+  --out checkpoints/toy-gpt-d1536-l18-h24-seq256-step50k.pt
+```
+
+Resume the same run later with the same checkpoint:
+
+```bash
+.venv/bin/python -m training.train_toy \
+  --text-file data/generated/tinystories_train.txt \
+  --device mps \
+  --steps 160000 \
+  --batch-size 32 \
+  --resume checkpoints/toy-gpt-d256-l4-h8-seq256-step120k.pt \
+  --out checkpoints/toy-gpt-d256-l4-h8-seq256-step160k.pt
+```
+
+If you change `--seq-len`, `--d-embed`, `--n-layers`, or `--n-head`, start a new checkpoint instead of resuming:
+
+```bash
+.venv/bin/python -m training.train_toy \
+  --text-file data/generated/tinystories_train.txt \
+  --device mps \
+  --steps 60000 \
   --batch-size 16 \
   --seq-len 256 \
   --d-embed 512 \
@@ -99,8 +172,13 @@ A full run:
   --eval-batches 10 \
   --sample-every 2000 \
   --sample-tokens 120 \
-  --out checkpoints/toy-gpt-512d.pt
+  --out checkpoints/toy-gpt-d512-l6-h8-seq256-step60k.pt
 ```
+
+Checkpoint naming tip:
+
+- Use filenames that encode the shape, for example `toy-gpt-d256-l4-h8-seq256-step120k.pt`
+- If you change `--seq-len`, `--d-embed`, `--n-layers`, or `--n-head`, start a new checkpoint name
 
 ## Prepare A Better Training Corpus
 
@@ -177,7 +255,7 @@ Train on assistant responses only:
   --n-head 8 \
   --eval-every 200 \
   --sample-every 1000 \
-  --out checkpoints/toy-gpt-sft.pt
+  --out checkpoints/toy-gpt-sft-d256-l4-h8-seq256.pt
 ```
 
 Resume:
@@ -188,8 +266,47 @@ Resume:
   --device mps \
   --steps 40000 \
   --batch-size 16 \
-  --resume checkpoints/toy-gpt-sft.pt \
-  --out checkpoints/toy-gpt-sft.pt
+  --resume checkpoints/toy-gpt-sft-d256-l4-h8-seq256.pt \
+  --out checkpoints/toy-gpt-sft-d256-l4-h8-seq256-step40k.pt
+```
+
+Best overnight path from this repo:
+
+1. Pretrain the toy model on TinyStories:
+
+```bash
+.venv/bin/python -m training.train_toy \
+  --text-file data/generated/tinystories_train.txt \
+  --device mps \
+  --steps 120000 \
+  --batch-size 32 \
+  --seq-len 256 \
+  --d-embed 256 \
+  --n-layers 4 \
+  --n-head 8 \
+  --eval-every 500 \
+  --eval-batches 10 \
+  --sample-every 2000 \
+  --sample-tokens 120 \
+  --out checkpoints/toy-gpt-d256-l4-h8-seq256-step120k.pt
+```
+
+2. Then initialize SFT from that checkpoint and train on `smol-smoltalk`:
+
+```bash
+.venv/bin/python -m training.train_toy_sft \
+  --data-file data/generated/smol_smoltalk_train.jsonl \
+  --device mps \
+  --steps 30000 \
+  --batch-size 16 \
+  --seq-len 256 \
+  --d-embed 256 \
+  --n-layers 4 \
+  --n-head 8 \
+  --init-from checkpoints/toy-gpt-d256-l4-h8-seq256-step120k.pt \
+  --eval-every 200 \
+  --sample-every 1000 \
+  --out checkpoints/toy-gpt-sft-d256-l4-h8-seq256-step30k.pt
 ```
 
 ## Benchmark

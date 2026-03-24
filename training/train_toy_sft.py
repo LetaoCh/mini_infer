@@ -10,7 +10,6 @@ import torch.nn.functional as F
 
 from models.gpt_full import ToyGPTConfig, ToyGPTForCausalLM, ToyTokenizer
 
-
 IGNORE_INDEX = -100
 
 
@@ -31,6 +30,7 @@ def parse_args():
     )
     parser.add_argument("--out", default="checkpoints/toy-gpt-sft.pt", help="Checkpoint output path.")
     parser.add_argument("--resume", help="Checkpoint path to resume training from.")
+    parser.add_argument("--init-from", help="Optional checkpoint path to initialize weights from before SFT.")
     parser.add_argument("--device", choices=["auto", "mps", "cuda", "cpu"], default="auto")
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -155,7 +155,9 @@ def get_batch(data, batch_size: int, seq_len: int, tokenizer: ToyTokenizer, devi
     return x, y, attention_mask
 
 
-def compute_loss(model: ToyGPTForCausalLM, x: torch.Tensor, y: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+def compute_loss(
+    model: ToyGPTForCausalLM, x: torch.Tensor, y: torch.Tensor, attention_mask: torch.Tensor
+) -> torch.Tensor:
     outputs = model(input_ids=x, attention_mask=attention_mask, use_cache=False)
     logits = outputs.logits
     shifted_logits = logits[:, :-1, :].contiguous()
@@ -229,6 +231,11 @@ def load_checkpoint(path: Path, device: torch.device):
     return checkpoint, config
 
 
+def assert_same_config(current: ToyGPTConfig, loaded: ToyGPTConfig, path: str):
+    if current != loaded:
+        raise ValueError(f"checkpoint config mismatch for {path}: " f"loaded={loaded} current={current}")
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
@@ -262,6 +269,10 @@ def main():
             max_seq_length=args.seq_len,
         )
         model = ToyGPTForCausalLM(config).to(device)
+        if args.init_from:
+            init_checkpoint, init_config = load_checkpoint(Path(args.init_from), device)
+            assert_same_config(config, init_config, args.init_from)
+            model.load_state_dict(init_checkpoint["model_state_dict"])
 
     records = load_chat_records(Path(args.data_file))
     train_records, val_records = split_records(records)
@@ -278,6 +289,8 @@ def main():
         f"config=d_embed:{config.d_embed} n_layers:{config.n_layers} "
         f"n_head:{config.n_head} seq_len:{config.max_seq_length} batch_size:{args.batch_size}"
     )
+    if args.init_from:
+        print(f"init_from={args.init_from}")
     if args.resume:
         print(f"resume={args.resume} start_step={start_step}")
         checkpoint_data_file = checkpoint.get("data_file")
